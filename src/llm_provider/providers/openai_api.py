@@ -7,9 +7,9 @@ import re
 import time
 
 import httpx
-import litellm
 
 from llm_provider._cache import cache_key, direct_cache
+from llm_provider.pricing import cost as _pricing_cost
 
 _THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
 _THINK_UNCLOSED_RE = re.compile(r"<think>.*", re.DOTALL)
@@ -38,17 +38,12 @@ def model_id(model: str) -> str:
 
 async def call(
     client,
-    litellm_model: str,
     model_id: str,
     prompt: str,
     system_prompt: str = "",
     **kwargs,
 ):
-    """Returns (texts: list[str], usage: dict).
-
-    litellm_model is the original model string (for cost lookup).
-    model_id is the API-level model name.
-    """
+    """Returns (texts: list[str], usage: dict)."""
     kwargs = dict(kwargs)
     messages = []
     if system_prompt:
@@ -92,17 +87,13 @@ async def call(
         if details:
             usage["cached_tokens"] = getattr(details, "cached_tokens", 0) or 0
 
-    # Cost via litellm's pricing database
-    try:
-        usage["cost"] = litellm.completion_cost(
-            model=litellm_model,
-            prompt_tokens=response.usage.prompt_tokens if response.usage else 0,
-            completion_tokens=(
-                response.usage.completion_tokens if response.usage else 0
-            ),
-        )
-    except Exception:
-        pass
+    c = _pricing_cost(
+        model_id,
+        usage.get("input_tokens", 0),
+        usage.get("output_tokens", 0),
+    )
+    if c is not None:
+        usage["cost"] = c
 
     if texts[0]:
         direct_cache.set(key, texts[0])

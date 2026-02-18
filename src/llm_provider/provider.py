@@ -6,6 +6,49 @@ from typing import Any
 
 from llm_provider.providers import gemini, litellm_api, local, openai_api, together
 
+# --- Adaptive concurrency (AIMD) ---
+
+_MIN_CONCURRENCY = 4
+
+
+class _AIMDSemaphore:
+    """Semaphore with additive-increase / multiplicative-decrease.
+
+    On success: window += 1 (up to max).
+    On 429: window //= 2 (down to _MIN_CONCURRENCY).
+    """
+
+    def __init__(self, initial: int):
+        self._max = initial
+        self._window = initial
+        self._sem = asyncio.Semaphore(initial)
+
+    async def acquire(self):
+        await self._sem.acquire()
+
+    def release(self):
+        self._sem.release()
+
+    def on_success(self):
+        if self._window < self._max:
+            self._window = min(self._window + 1, self._max)
+            # Grow the semaphore by releasing one extra permit
+            self._sem.release()
+
+    def on_rate_limit(self):
+        new = max(self._window // 2, _MIN_CONCURRENCY)
+        if new < self._window:
+            shrink = self._window - new
+            for _ in range(shrink):
+                if self._sem._value > 0:  # noqa: SLF001
+                    self._sem._value -= 1  # noqa: SLF001
+            self._window = new
+
+    @property
+    def window(self):
+        return self._window
+
+
 # --- Provider detection ---
 
 _OPENAI_PREFIXES = ("gpt-", "o1", "o3", "o4", "chatgpt-")
@@ -26,6 +69,18 @@ def _is_together(model: str) -> bool:
 
 def _is_local(model: str) -> bool:
     return model.startswith("local/")
+
+
+def _is_rate_limit(exc: Exception) -> bool:
+    """Check if an exception is a 429 rate limit error."""
+    # OpenAI SDK
+    if type(exc).__name__ == "RateLimitError":
+        return True
+    # HTTP status code
+    status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    if status == 429:
+        return True
+    return False
 
 
 def _run_async(coro):
@@ -86,9 +141,7 @@ class LLM:
         cost_before = self.total_cost
 
         t0 = time.monotonic()
-        results = _run_async(
-            self._batch(prompt_list, system_prompt or "", silent, **kwargs)
-        )
+        results = _run_async(self._batch(prompt_list, system_prompt or "", **kwargs))
         elapsed = time.monotonic() - t0
 
         call_out = self.total_output_tokens - out_before
@@ -107,13 +160,22 @@ class LLM:
         return results
 
     async def _batch(
-        self, prompts: list[str], system_prompt: str, silent: bool, **kwargs
+        self, prompts: list[str], system_prompt: str, **kwargs
     ) -> list[list[str]]:
-        sem = asyncio.Semaphore(self.max_concurrent)
+        sem = _AIMDSemaphore(self.max_concurrent)
 
         async def run_one(prompt: str) -> list[str]:
-            async with sem:
-                return await self._call(prompt, system_prompt, **kwargs)
+            await sem.acquire()
+            try:
+                result = await self._call(prompt, system_prompt, **kwargs)
+                sem.on_success()
+                return result
+            except Exception as e:
+                if _is_rate_limit(e):
+                    sem.on_rate_limit()
+                raise
+            finally:
+                sem.release()
 
         tasks = [run_one(p) for p in prompts]
         return await asyncio.gather(*tasks)
@@ -126,7 +188,6 @@ class LLM:
         elif _is_openai(self.model):
             texts, usage = await openai_api.call(
                 self._client,
-                self.model,
                 openai_api.model_id(self.model),
                 prompt,
                 system_prompt,
@@ -135,7 +196,6 @@ class LLM:
         elif _is_together(self.model):
             texts, usage = await openai_api.call(
                 self._client,
-                self.model,
                 together.model_id(self.model),
                 prompt,
                 system_prompt,
@@ -144,7 +204,6 @@ class LLM:
         elif _is_local(self.model):
             texts, usage = await openai_api.call(
                 self._client,
-                self.model,
                 local.model_id(self.model),
                 prompt,
                 system_prompt,

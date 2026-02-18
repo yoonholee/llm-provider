@@ -157,7 +157,7 @@ class TestCallThinkingIntegration:
 
         return asyncio.run(coro)
 
-    def _call_with_mock_cache(self, client, litellm_model, model_id, prompt):
+    def _call_with_mock_cache(self, client, model_id, prompt):
         """Run openai_api.call() with cache bypassed."""
         import llm_provider.providers.openai_api as oai_mod
 
@@ -166,7 +166,7 @@ class TestCallThinkingIntegration:
         original = oai_mod.direct_cache
         oai_mod.direct_cache = mock_cache
         try:
-            return self._run(openai_api.call(client, litellm_model, model_id, prompt))
+            return self._run(openai_api.call(client, model_id, prompt))
         finally:
             oai_mod.direct_cache = original
 
@@ -179,9 +179,7 @@ class TestCallThinkingIntegration:
         )
         client.chat.completions.create = AsyncMock(return_value=resp)
 
-        texts, usage = self._call_with_mock_cache(
-            client, "local/Qwen/Qwen3-4B", "Qwen/Qwen3-4B", "test"
-        )
+        texts, usage = self._call_with_mock_cache(client, "Qwen/Qwen3-4B", "test")
         assert texts == ["Paris"]
 
     def test_client_side_strip(self):
@@ -193,9 +191,7 @@ class TestCallThinkingIntegration:
         )
         client.chat.completions.create = AsyncMock(return_value=resp)
 
-        texts, usage = self._call_with_mock_cache(
-            client, "local/Qwen/Qwen3-4B", "Qwen/Qwen3-4B", "test"
-        )
+        texts, usage = self._call_with_mock_cache(client, "Qwen/Qwen3-4B", "test")
         assert texts == ["Paris"]
 
     def test_no_thinking_passthrough(self):
@@ -204,9 +200,7 @@ class TestCallThinkingIntegration:
         resp = self._make_response(content="Hello world")
         client.chat.completions.create = AsyncMock(return_value=resp)
 
-        texts, usage = self._call_with_mock_cache(
-            client, "gpt-4.1-nano", "gpt-4.1-nano", "test"
-        )
+        texts, usage = self._call_with_mock_cache(client, "gpt-4.1-nano", "test")
         assert texts == ["Hello world"]
 
 

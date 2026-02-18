@@ -10,12 +10,10 @@ import litellm
 from diskcache import FanoutCache
 from litellm.caching.caching import Cache
 
-# Silence noisy loggers
 for name in ("openai", "httpx", "LiteLLM", "LiteLLM Router", "LiteLLM Proxy"):
     logging.getLogger(name).setLevel(logging.WARNING)
 litellm.suppress_debug_info = True
 
-# Resolve cache directory
 _cache_dir = os.environ.get("LLM_CACHE_DIR", None)
 if _cache_dir is None:
     candidates = [Path("/iris/u/yoonho/.cache/llm_cache"), Path("/tmp/llm_cache")]
