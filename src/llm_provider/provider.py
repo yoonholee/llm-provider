@@ -141,10 +141,11 @@ def _is_rate_limit(exc: Exception) -> bool:
     # OpenAI SDK
     if type(exc).__name__ == "RateLimitError":
         return True
-    # HTTP status code
-    status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
-    if status == 429:
-        return True
+    # HTTP status code — check .status_code, .status, and .code (google.genai uses .code)
+    for attr in ("status_code", "status", "code"):
+        val = getattr(exc, attr, None)
+        if val == 429:
+            return True
     return False
 
 

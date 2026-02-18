@@ -20,6 +20,33 @@ from llm_provider.provider import (
 from llm_provider.providers import gemini, local, openai_api, together
 
 
+# --- Rate limit detection ---
+
+
+class TestIsRateLimit:
+    def test_status_code_429(self):
+        e = Exception()
+        e.status_code = 429
+        assert _is_rate_limit(e)
+
+    def test_code_429_gemini(self):
+        """google.genai.errors.ClientError uses .code for HTTP status."""
+        e = Exception()
+        e.code = 429
+        assert _is_rate_limit(e)
+
+    def test_rate_limit_error_by_name(self):
+        class RateLimitError(Exception):
+            pass
+
+        assert _is_rate_limit(RateLimitError())
+
+    def test_non_429(self):
+        e = Exception()
+        e.status_code = 500
+        assert not _is_rate_limit(e)
+
+
 # --- Provider detection ---
 
 
