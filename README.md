@@ -4,16 +4,17 @@ Thin LLM wrapper that bypasses litellm's overhead for major providers. Uses dire
 
 ## Why not just litellm?
 
-Throughput has mostly converged with litellm 1.81+, but direct SDKs still win on latency, correctness, and startup:
+At low concurrency the gap is small, but at batch scale (c=32+) HTTP/2 multiplexing dominates:
 
-| Provider | TTFT | Throughput | Notes |
-|---|---|---|---|
-| OpenAI | 1.3-2x faster | ~same | HTTP/2 via `httpx[http2]` reduces TTFT |
-| Together | 1.3x faster, less variance | ~same | litellm has occasional TTFT spikes |
-| Gemini | ~same | ~same | Correctness: litellm returns `content=None` with thinking enabled |
-| Anthropic | -- | -- | Kept on litellm (direct SDK is actually slower) |
+| Provider | c | Throughput | TTFT p50 | TTFT p95 | Notes |
+|---|---|---|---|---|---|
+| OpenAI | 32 | **1.5x** (2456 vs 1674) | **2.4x** (0.21 vs 0.51s) | **2.1x** (0.75 vs 1.59s) | HTTP/2 via `httpx[http2]` |
+| OpenAI | 64 | **2.3x** (4096 vs 1783) | **2.6x** (0.29 vs 0.77s) | **5.2x** (0.56 vs 2.92s) | litellm hits HTTP/1.1 connection limits |
+| Together | 32 | **1.3x** (2010 vs 1597) | 1.2x (0.39 vs 0.48s) | 1.2x | |
+| Gemini | -- | ~same | ~same | ~same | Correctness: litellm returns `content=None` with thinking enabled |
+| Anthropic | -- | -- | -- | -- | Kept on litellm (direct SDK is actually slower) |
 
-*Measured with streaming, n=16, c=16, litellm 1.81.13 (Feb 2026).*
+*Measured with streaming, n=64, litellm 1.81.13 (Feb 2026).*
 
 Other features:
 - **Lazy imports** (0.1s import vs 4s with litellm eager loading)
