@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "llm-provider"
+version = "0.1.0"
+description = "Thin LLM wrapper with disk caching, async batching, and per-provider SDK routing"
+requires-python = ">=3.10"
+dependencies = [
+    "litellm",
+    "diskcache>=5.6.3",
+    "httpx[http2]",
+    "openai>=1.0.0",
+    "google-genai",
+    "nest-asyncio",
+]
+
+[project.optional-dependencies]
+together = ["openai>=1.0.0"]
