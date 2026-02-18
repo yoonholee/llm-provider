@@ -130,10 +130,21 @@ class LLM:
         prompts: str | list[str],
         system_prompt: str | None = None,
         silent: bool = False,
+        n: int = 1,
+        cache: bool = True,
         **kwargs: Any,
     ) -> list[list[str]]:
-        """Generate completions. Returns list of response lists (one per prompt)."""
+        """Generate completions. Returns list of response lists (one per prompt).
+
+        Args:
+            n: Number of completions per prompt (default 1).
+            cache: Whether to use disk cache (default True).
+        """
         prompt_list = [prompts] if isinstance(prompts, str) else prompts
+        if n > 1:
+            kwargs["n"] = n
+        if not cache:
+            kwargs["cache"] = False
 
         out_before = self.total_output_tokens
         in_before = self.total_input_tokens

@@ -45,6 +45,7 @@ async def call(
 ):
     """Returns (texts: list[str], usage: dict)."""
     kwargs = dict(kwargs)
+    use_cache = kwargs.pop("cache", True)
     messages = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
@@ -57,9 +58,12 @@ async def call(
     # Cache lookup -- include all kwargs that affect output
     config_dict = {k: v for k, v in sorted(kwargs.items()) if v is not None}
     key = cache_key(model_id, prompt, system_prompt or None, config_dict)
-    cached = direct_cache.get(key)
-    if cached is not None:
-        return [cached], {}
+    if use_cache:
+        cached = direct_cache.get(key)
+        if cached is not None:
+            if isinstance(cached, list):
+                return cached, {}
+            return [cached], {}
 
     response = await client.chat.completions.create(
         model=model_id, messages=messages, **kwargs
@@ -95,8 +99,11 @@ async def call(
     if c is not None:
         usage["cost"] = c
 
-    if texts[0]:
-        direct_cache.set(key, texts[0])
+    if use_cache and texts[0]:
+        if len(texts) == 1:
+            direct_cache.set(key, texts[0])
+        else:
+            direct_cache.set(key, texts)
     return texts, usage
 
 

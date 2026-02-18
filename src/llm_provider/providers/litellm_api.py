@@ -18,6 +18,7 @@ async def call(
 ):
     """Returns (texts: list[str], usage: dict)."""
     kwargs = dict(kwargs)
+    use_cache = kwargs.pop("cache", True)
     messages = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
@@ -31,7 +32,7 @@ async def call(
         model=model,
         messages=messages,
         num_retries=max_retries,
-        caching=True,
+        caching=use_cache,
         **kwargs,
     )
 

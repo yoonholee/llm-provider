@@ -25,6 +25,8 @@ async def call(client, model: str, prompt: str, system_prompt: str = "", **kwarg
     import google.genai.types as types
 
     kwargs = dict(kwargs)
+    use_cache = kwargs.pop("cache", True)
+    n = kwargs.pop("n", 1)
     mid = model_id(model)
 
     # thinking_budget=0 disables thinking (fastest config)
@@ -61,32 +63,57 @@ async def call(client, model: str, prompt: str, system_prompt: str = "", **kwarg
         "top_p": top_p,
         "system": system_prompt or None,
     }
+    if n > 1:
+        config_dict["n"] = n
     key = cache_key(mid, prompt, system_prompt or None, config_dict)
-    cached = direct_cache.get(key)
-    if cached is not None:
-        return [cached], {}
+    if use_cache:
+        cached = direct_cache.get(key)
+        if cached is not None:
+            if isinstance(cached, list):
+                return cached, {}
+            return [cached], {}
 
-    # Stream response for lower TTFT
-    chunks: list[str] = []
-    last_chunk = None
-    async for chunk in await client.aio.models.generate_content_stream(
-        model=mid, contents=prompt, config=config
-    ):
-        if chunk.text:
-            chunks.append(chunk.text)
-        last_chunk = chunk
+    async def _single_call():
+        chunks: list[str] = []
+        last_chunk = None
+        async for chunk in await client.aio.models.generate_content_stream(
+            model=mid, contents=prompt, config=config
+        ):
+            if chunk.text:
+                chunks.append(chunk.text)
+            last_chunk = chunk
+        return "".join(chunks), last_chunk
 
-    text = "".join(chunks)
+    if n > 1:
+        import asyncio
 
-    usage = {}
-    if last_chunk and last_chunk.usage_metadata:
-        meta = last_chunk.usage_metadata
-        usage["input_tokens"] = meta.prompt_token_count or 0
-        usage["output_tokens"] = meta.candidates_token_count or 0
+        results = await asyncio.gather(*[_single_call() for _ in range(n)])
+        texts = [r[0] for r in results]
+        usage = {}
+        last = results[-1][1]
+        if last and last.usage_metadata:
+            meta = last.usage_metadata
+            usage["input_tokens"] = (meta.prompt_token_count or 0) * n
+            usage["output_tokens"] = sum(
+                (r[1].usage_metadata.candidates_token_count or 0)
+                for r in results
+                if r[1] and r[1].usage_metadata
+            )
+    else:
+        text, last_chunk = await _single_call()
+        texts = [text]
+        usage = {}
+        if last_chunk and last_chunk.usage_metadata:
+            meta = last_chunk.usage_metadata
+            usage["input_tokens"] = meta.prompt_token_count or 0
+            usage["output_tokens"] = meta.candidates_token_count or 0
 
-    if text:
-        direct_cache.set(key, text)
-    return [text], usage
+    if use_cache and texts[0]:
+        if len(texts) == 1:
+            direct_cache.set(key, texts[0])
+        else:
+            direct_cache.set(key, texts)
+    return texts, usage
 
 
 async def bench_stream(client, model: str, messages: list, **kwargs):

@@ -308,3 +308,100 @@ class TestLLMGenerate:
 
         assert results == [["cached!"]]
         assert llm.total_input_tokens == 0
+
+    def test_cache_false_skips_cache(self):
+        """cache=False should call API even when cache has value."""
+        import llm_provider.providers.openai_api as oai_mod
+
+        llm = LLM("gpt-4.1-nano")
+
+        mock_cache = MagicMock()
+        mock_cache.get.return_value = "cached!"
+        original_cache = oai_mod.direct_cache
+        oai_mod.direct_cache = mock_cache
+
+        # Mock API response
+        msg = MagicMock()
+        msg.content = "fresh!"
+        msg.reasoning_content = None
+        choice = MagicMock()
+        choice.message = msg
+        resp = MagicMock()
+        resp.choices = [choice]
+        resp.usage.prompt_tokens = 10
+        resp.usage.completion_tokens = 5
+        resp.usage.prompt_tokens_details = None
+        llm._client.chat.completions.create = AsyncMock(return_value=resp)
+
+        try:
+            results = llm.generate("test", cache=False, silent=True)
+        finally:
+            oai_mod.direct_cache = original_cache
+
+        assert results == [["fresh!"]]
+        # Cache.get should not have been called
+        mock_cache.get.assert_not_called()
+        # Cache.set should not have been called
+        mock_cache.set.assert_not_called()
+
+    def test_cache_hit_with_list(self):
+        """Cache storing a list (from n>1) should return correctly."""
+        import llm_provider.providers.openai_api as oai_mod
+
+        llm = LLM("gpt-4.1-nano")
+
+        mock_cache = MagicMock()
+        mock_cache.get.return_value = ["resp1", "resp2", "resp3"]
+        original_cache = oai_mod.direct_cache
+        oai_mod.direct_cache = mock_cache
+        try:
+            results = llm.generate("test", silent=True)
+        finally:
+            oai_mod.direct_cache = original_cache
+
+        assert results == [["resp1", "resp2", "resp3"]]
+
+    def test_n_returns_multiple(self):
+        """n=3 should return 3 responses per prompt."""
+        import llm_provider.providers.openai_api as oai_mod
+
+        llm = LLM("gpt-4.1-nano")
+
+        # Mock cache miss
+        mock_cache = MagicMock()
+        mock_cache.get.return_value = None
+        original_cache = oai_mod.direct_cache
+        oai_mod.direct_cache = mock_cache
+
+        # Mock API returning 3 choices
+        choices = []
+        for text in ["resp1", "resp2", "resp3"]:
+            msg = MagicMock()
+            msg.content = text
+            msg.reasoning_content = None
+            choice = MagicMock()
+            choice.message = msg
+            choices.append(choice)
+        resp = MagicMock()
+        resp.choices = choices
+        resp.usage.prompt_tokens = 10
+        resp.usage.completion_tokens = 15
+        resp.usage.prompt_tokens_details = None
+        llm._client.chat.completions.create = AsyncMock(return_value=resp)
+
+        try:
+            results = llm.generate("test", n=3, silent=True)
+        finally:
+            oai_mod.direct_cache = original_cache
+
+        assert results == [["resp1", "resp2", "resp3"]]
+        # Should have cached the full list
+        mock_cache.set.assert_called_once()
+        cached_value = mock_cache.set.call_args[0][1]
+        assert cached_value == ["resp1", "resp2", "resp3"]
+
+    def test_n_changes_cache_key(self):
+        """n>1 should produce a different cache key than n=1."""
+        k1 = cache_key("model", "prompt", None, {})
+        k2 = cache_key("model", "prompt", None, {"n": 3})
+        assert k1 != k2
