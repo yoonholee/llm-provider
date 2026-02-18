@@ -1,50 +1,21 @@
 """Gemini provider via native google.genai SDK with streaming."""
 
 import os
-import threading
 import time
 
 from llm_provider._cache import cache_key, direct_cache
-
-
-class _ClientPool:
-    """Round-robin pool of Gemini clients for API key rotation.
-
-    Accepts GEMINI_API_KEY as a single key or comma-separated list.
-    On 429, call rotate() to advance to the next key.
-    """
-
-    def __init__(self, keys: list[str]):
-        import google.genai as genai
-
-        self._clients = [genai.Client(api_key=k.strip()) for k in keys if k.strip()]
-        if not self._clients:
-            raise ValueError("GEMINI_API_KEY required for Gemini models")
-        self._idx = 0
-        self._lock = threading.Lock()
-
-    @property
-    def current(self):
-        return self._clients[self._idx % len(self._clients)]
-
-    def rotate(self):
-        """Advance to the next client. Returns True if there are multiple keys."""
-        if len(self._clients) <= 1:
-            return False
-        with self._lock:
-            self._idx = (self._idx + 1) % len(self._clients)
-        return True
-
-    def __len__(self):
-        return len(self._clients)
+from llm_provider.providers._pool import ClientPool
 
 
 def create_client():
+    import google.genai as genai
+
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise ValueError("GEMINI_API_KEY required for Gemini models")
-    keys = api_key.split(",")
-    return _ClientPool(keys)
+    keys = [k.strip() for k in api_key.split(",") if k.strip()]
+    clients = [genai.Client(api_key=k) for k in keys]
+    return ClientPool(clients)
 
 
 def model_id(model: str) -> str:

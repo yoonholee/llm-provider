@@ -6,9 +6,18 @@ import os
 def create_client(max_retries: int = 2):
     from openai import AsyncOpenAI
 
+    from llm_provider.providers._pool import ClientPool
+
     api_key = os.environ.get("TOGETHER_API_KEY") or os.environ.get("TOGETHERAI_API_KEY")
     if not api_key:
         raise ValueError("TOGETHER_API_KEY required for Together models (direct SDK)")
+    keys = [k.strip() for k in api_key.split(",") if k.strip()]
+    if len(keys) > 1:
+        clients = [
+            AsyncOpenAI(api_key=k, base_url="https://api.together.xyz/v1", max_retries=max_retries)
+            for k in keys
+        ]
+        return ClientPool(clients)
     return AsyncOpenAI(
         api_key=api_key,
         base_url="https://api.together.xyz/v1",

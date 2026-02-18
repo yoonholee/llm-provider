@@ -3,6 +3,7 @@
 Also used by Together and local (OpenAI-compatible API).
 """
 
+import os
 import re
 import time
 
@@ -25,6 +26,16 @@ def strip_thinking(text: str) -> str:
 def create_client(max_retries: int = 2):
     from openai import AsyncOpenAI
 
+    from llm_provider.providers._pool import ClientPool
+
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    keys = [k.strip() for k in api_key.split(",") if k.strip()]
+    if len(keys) > 1:
+        clients = [
+            AsyncOpenAI(api_key=k, http_client=httpx.AsyncClient(http2=True), max_retries=max_retries)
+            for k in keys
+        ]
+        return ClientPool(clients)
     return AsyncOpenAI(
         http_client=httpx.AsyncClient(http2=True),
         max_retries=max_retries,
