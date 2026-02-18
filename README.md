@@ -4,19 +4,21 @@ Thin LLM wrapper that bypasses litellm's overhead for major providers. Uses dire
 
 ## Why not just litellm?
 
-litellm is convenient but adds measurable overhead. Benchmarked improvements from direct SDK routing:
+Throughput has mostly converged with litellm 1.81+, but direct SDKs still win on latency, correctness, and startup:
 
-| Provider | Improvement | Key optimization |
-|---|---|---|
-| OpenAI | 1.5-2x throughput, 2x TTFT | HTTP/2 via `httpx[http2]` |
-| Together | 1.6x throughput, 2.5x TTFT | Skip litellm dispatch |
-| Gemini | 1.4x TTFT + correctness | Native `google.genai` SDK (litellm returns `content=None` with thinking enabled) |
-| Anthropic | -- | Kept on litellm (direct SDK is actually slower) |
+| Provider | TTFT | Throughput | Notes |
+|---|---|---|---|
+| OpenAI | 1.3-2x faster | ~same | HTTP/2 via `httpx[http2]` reduces TTFT |
+| Together | 1.3x faster, less variance | ~same | litellm has occasional TTFT spikes |
+| Gemini | ~same | ~same | Correctness: litellm returns `content=None` with thinking enabled |
+| Anthropic | -- | -- | Kept on litellm (direct SDK is actually slower) |
 
-Other features litellm doesn't give you out of the box:
+*Measured with streaming, n=16, c=16, litellm 1.81.13 (Feb 2026).*
+
+Other features:
+- **Lazy imports** (0.1s import vs 4s with litellm eager loading)
 - **Disk caching** across all providers (deterministic, SHA-256 keyed)
 - **Adaptive concurrency** (AIMD: ramps up on success, backs off on 429)
-- **Lazy imports** (0.1s import vs 4s with litellm eager loading)
 - **Cumulative usage tracking** (input/output/cached tokens, cost)
 - **Prefix cache tracking** for OpenAI/Anthropic
 
