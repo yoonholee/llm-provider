@@ -28,7 +28,7 @@ Provider detection: Gemini (`gemini/*`), OpenAI (`gpt-*`, `o1*`, `o3*`, `o4*`, `
 | httpx keepalive_expiry, pool_timeout, big pool | No improvement on top of http2 |
 | TCP_NODELAY (socket_options) | Not supported by httpx.AsyncClient |
 | HTTP/2 for Together | Hurt throughput |
-| Direct Anthropic SDK | Slower than litellm (636 vs 1051 tok/s) |
+| Direct Anthropic SDK | Slower than litellm at c=32 (1543 vs 1882 tok/s), noisy at c=64. HTTP/2 doesn't help. |
 | Scheduling order (longest-first) | Minimal effect with gather+semaphore |
 | litellm 1.81.x | Worse bugs than 1.80.9 (pass-through broken, event loop spam) |
 
@@ -54,7 +54,12 @@ Provider detection: Gemini (`gemini/*`), OpenAI (`gpt-*`, `o1*`, `o3*`, `o4*`, `
 - Suffers badly with long system prompts (4.14s TTFT vs 0.23s for OpenAI)
 
 **Anthropic:**
-- Keep on litellm (direct SDK is slower)
+- Keep on litellm (direct SDK is slower). Re-tested 2026-02-17 with anthropic 0.81.0:
+  - c=32: direct+h2 = 0.80-0.83x of litellm (consistently slower, 3 runs)
+  - c=64: noisy (0.58x to 1.13x), no reliable advantage either way
+  - TTFT p50 slightly better with direct+h2 at c=64 (~0.49s vs ~0.74s) but throughput isn't
+  - HTTP/2 doesn't help Anthropic the way it helps OpenAI (non-streaming: h2 was 1275 vs default 1376 tok/s at c=32)
+  - Hypothesis: Anthropic API may use connection-level rate limiting that negates HTTP/2 multiplexing benefits
 - litellm 1.80.9–1.80.11 recommended (avoid 1.81.x)
 
 **litellm:**
@@ -108,6 +113,58 @@ Tested uvloop as event loop replacement. Results within noise on Python 3.13:
 - OpenAI: 846 tok/s (baseline 965) -- actually worse
 - Gemini: 775 tok/s (baseline 742) -- marginally better
 Not worth the dependency. The asyncio bottleneck is API latency, not event loop scheduling.
+
+### Concurrency sweep (2026-02-17)
+
+n=64 prompts, streaming, direct SDK vs litellm at each concurrency level.
+
+**OpenAI (gpt-4.1-nano):**
+| c | Path | tok/s | TTFT p50 | TTFT p95 | wall |
+|---|---|---|---|---|---|
+| 32 | direct | 2456 | 0.213s | 0.753s | 3.50s |
+| 32 | litellm | 1674 | 0.507s | 1.585s | 5.26s |
+| 64 | direct | 4096 | 0.293s | 0.563s | 2.09s |
+| 64 | litellm | 1783 | 0.766s | 2.924s | 4.70s |
+
+Key: HTTP/2 multiplexing dominates at c=32+. litellm's HTTP/1.1 can't multiplex, so each concurrent request needs its own TCP connection, hitting limits.
+
+**Gemini (gemini-3-flash-preview):**
+| c | Path | tok/s | TTFT p50 | TTFT p95 | wall |
+|---|---|---|---|---|---|
+| 8 | direct | 682 | 0.836s | 1.025s | 12.57s |
+| 8 | litellm | 640 | 0.826s | 1.039s | 13.15s |
+| 16 | direct | 1369 | 0.800s | 1.063s | 6.28s |
+| 16 | litellm | 1303 | 0.818s | 1.033s | 6.44s |
+| 32 | direct | 2420 | 0.872s | 1.076s | 3.52s |
+| 32 | litellm | 2329 | 0.814s | 1.057s | 3.75s |
+| 64 | direct | 4209 | 0.889s | 1.096s | 2.00s |
+| 64 | litellm | 2692 | 0.915s | 2.275s | 3.17s |
+
+Key: Nearly identical until c=64, where direct SDK pulls ahead 1.6x. Gemini native SDK uses HTTP/2 by default. litellm's p95 TTFT degrades 2.1x at c=64.
+
+**Together (Llama-3.3-70B-Instruct-Turbo):**
+| c | Path | tok/s | TTFT p50 | TTFT p95 |
+|---|---|---|---|---|
+| 32 | direct | 2010 | 0.394s | 0.984s |
+| 32 | litellm | 1597 | 0.475s | 1.145s |
+| 64 | direct | 1145 | 0.850s | 2.625s |
+| 64 | litellm | 1720 | 0.806s | 5.112s |
+
+Key: Direct wins at c=32 (1.3x), but at c=64 Together's rate limits kick in and both degrade. HTTP/2 actually hurts Together (tested separately).
+
+**Anthropic (claude-haiku-4.5, anthropic 0.81.0):**
+| c | Path | tok/s | TTFT p50 | TTFT p95 |
+|---|---|---|---|---|
+| 8 | direct+h2 | 462 | 0.570s | 1.214s |
+| 8 | litellm | 658 | 0.445s | 0.686s |
+| 16 | direct+h2 | 940 | 0.446s | 0.911s |
+| 16 | litellm | 1062 | 0.462s | 0.932s |
+| 32 | direct+h2 | 1543 (median of 3) | 0.486s | 0.803s |
+| 32 | litellm | 1861 (median of 3) | 0.544s | 0.776s |
+| 64 | direct+h2 | 1587 (high variance) | 0.491s | 1.003s |
+| 64 | litellm | 1972 (high variance) | 0.793s | 1.796s |
+
+Key: litellm is consistently faster at c=8-32. At c=64, throughput is noisy (ratio 0.58-1.13x across runs). Direct+h2 has better TTFT p50 at c=64 but unreliable throughput advantage. HTTP/2 doesn't help Anthropic — may use per-connection rate limiting. Decision: keep on litellm.
 
 ### Future optimization ideas (not yet implemented)
 - **Key rotation**: Round-robin across API keys for Nx rate limit multiplier.

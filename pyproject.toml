@@ -14,6 +14,7 @@ dependencies = [
     "openai>=2.21",
     "google-genai>=1.63",
     "nest-asyncio",
+    "anthropic>=0.81.0",
 ]
 
 [project.optional-dependencies]

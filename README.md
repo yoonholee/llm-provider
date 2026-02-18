@@ -9,18 +9,18 @@ At low concurrency the gap is small, but at batch scale (c=32+) HTTP/2 multiplex
 | Provider | c | Throughput | TTFT p50 | TTFT p95 | Notes |
 |---|---|---|---|---|---|
 | OpenAI | 32 | **1.5x** (2456 vs 1674) | **2.4x** (0.21 vs 0.51s) | **2.1x** (0.75 vs 1.59s) | HTTP/2 via `httpx[http2]` |
-| OpenAI | 64 | **2.3x** (4096 vs 1783) | **2.6x** (0.29 vs 0.77s) | **5.2x** (0.56 vs 2.92s) | litellm hits HTTP/1.1 connection limits |
-| Together | 32 | **1.3x** (2010 vs 1597) | 1.2x (0.39 vs 0.48s) | 1.2x | |
-| Gemini | -- | ~same | ~same | ~same | Correctness: litellm returns `content=None` with thinking enabled |
-| Anthropic | -- | -- | -- | -- | Kept on litellm (direct SDK is actually slower) |
+| OpenAI | 64 | **2.3x** (4096 vs 1783) | **2.6x** (0.29 vs 0.77s) | **5.2x** (0.56 vs 2.92s) | HTTP/2 multiplexing vs HTTP/1.1 connection limits |
+| Together | 32 | **1.3x** (2010 vs 1597) | 1.2x (0.39 vs 0.48s) | 1.2x | Direct SDK avoids litellm overhead |
+| Gemini | 64 | **1.6x** (4209 vs 2692) | ~same (0.89 vs 0.92s) | **2.1x** (1.10 vs 2.28s) | Native SDK; litellm returns `content=None` with thinking |
+| Anthropic | -- | -- | -- | -- | Kept on litellm (direct SDK benchmarked slower) |
 
 *Measured with streaming, n=64, litellm 1.81.13 (Feb 2026).*
 
 Other features:
-- **Lazy imports** (0.1s import vs 4s with litellm eager loading)
-- **Disk caching** across all providers (deterministic, SHA-256 keyed)
-- **Adaptive concurrency** (AIMD: ramps up on success, backs off on 429)
-- **Cumulative usage tracking** (input/output/cached tokens, cost)
+- **Lazy imports** -- 0.1s import vs 4s with litellm eager loading
+- **Disk caching** -- deterministic SHA-256 keyed; works across all providers including direct SDK paths (litellm only caches its own calls)
+- **Adaptive concurrency** -- AIMD: ramps up on success, backs off on 429 (litellm uses fixed concurrency)
+- **Cumulative usage tracking** -- input/output/cached tokens + cost per instance (litellm tracks globally, not per-instance)
 - **Prefix cache tracking** for OpenAI/Anthropic
 
 ## Install / upgrade
