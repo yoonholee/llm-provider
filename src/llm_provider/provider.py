@@ -1,14 +1,23 @@
 """LLM class: per-provider routing with disk caching and async batching."""
 
 import asyncio
+import fcntl
+import logging
+import os
+import random
 import time
+from pathlib import Path
 from typing import Any
 
 from llm_provider.providers import gemini, litellm_api, local, openai_api, together
 
+log = logging.getLogger(__name__)
+
 # --- Adaptive concurrency (AIMD) ---
 
 _MIN_CONCURRENCY = 4
+_MAX_RETRIES = 5
+_BASE_DELAY = 2.0  # seconds
 
 
 class _AIMDSemaphore:
@@ -47,6 +56,62 @@ class _AIMDSemaphore:
     @property
     def window(self):
         return self._window
+
+
+# --- Cross-process file-lock semaphore ---
+
+
+class _FileSlotSemaphore:
+    """Cross-process semaphore using file locks.
+
+    Creates N lock files in lock_dir. Each acquire() tries to flock one.
+    Locks auto-release on process crash (OS guarantee).
+    """
+
+    def __init__(self, max_slots: int, lock_dir: str = "/tmp"):
+        self._slots = max_slots
+        self._dir = Path(lock_dir)
+        self._dir.mkdir(parents=True, exist_ok=True)
+        self._paths = [
+            self._dir / f"llm_provider_slot_{i}.lock" for i in range(max_slots)
+        ]
+        self._held: dict = {}  # task -> fd
+
+    async def __aenter__(self):
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, *exc):
+        self.release()
+
+    async def acquire(self):
+        """Block until a slot is available."""
+        task = asyncio.current_task()
+        while True:
+            for path in self._paths:
+                fd = open(path, "w")
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    self._held[task] = fd
+                    return
+                except (BlockingIOError, OSError):
+                    fd.close()
+            await asyncio.sleep(0.05 + random.random() * 0.05)
+
+    def release(self):
+        task = asyncio.current_task()
+        fd = self._held.pop(task, None)
+        if fd:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            fd.close()
+
+
+def _get_global_semaphore() -> _FileSlotSemaphore | None:
+    """Return a global file-lock semaphore if LLM_GLOBAL_CONCURRENCY is set."""
+    val = os.environ.get("LLM_GLOBAL_CONCURRENCY")
+    if val:
+        return _FileSlotSemaphore(int(val))
+    return None
 
 
 # --- Provider detection ---
@@ -174,19 +239,35 @@ class LLM:
         self, prompts: list[str], system_prompt: str, **kwargs
     ) -> list[list[str]]:
         sem = _AIMDSemaphore(self.max_concurrent)
+        global_sem = _get_global_semaphore()
 
         async def run_one(prompt: str) -> list[str]:
-            await sem.acquire()
-            try:
-                result = await self._call(prompt, system_prompt, **kwargs)
-                sem.on_success()
-                return result
-            except Exception as e:
-                if _is_rate_limit(e):
-                    sem.on_rate_limit()
-                raise
-            finally:
-                sem.release()
+            for attempt in range(_MAX_RETRIES + 1):
+                if global_sem:
+                    await global_sem.acquire()
+                await sem.acquire()
+                try:
+                    result = await self._call(prompt, system_prompt, **kwargs)
+                    sem.on_success()
+                    return result
+                except Exception as e:
+                    if _is_rate_limit(e):
+                        sem.on_rate_limit()
+                        if attempt < _MAX_RETRIES:
+                            delay = _BASE_DELAY * (2**attempt) + random.random()
+                            log.warning(
+                                "429 rate limit (attempt %d/%d), retrying in %.1fs",
+                                attempt + 1,
+                                _MAX_RETRIES,
+                                delay,
+                            )
+                            await asyncio.sleep(delay)
+                            continue
+                    raise
+                finally:
+                    sem.release()
+                    if global_sem:
+                        global_sem.release()
 
         tasks = [run_one(p) for p in prompts]
         return await asyncio.gather(*tasks)

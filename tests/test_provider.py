@@ -1,5 +1,7 @@
 """Tests for llm_provider (no API keys needed)."""
 
+import asyncio
+import tempfile
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -7,10 +9,12 @@ import pytest
 from llm_provider._cache import cache_key
 from llm_provider.provider import (
     LLM,
+    _FileSlotSemaphore,
     _is_gemini,
     _is_local,
     _is_openai,
     _is_together,
+    _is_rate_limit,
     _median,
 )
 from llm_provider.providers import gemini, local, openai_api, together
@@ -405,3 +409,113 @@ class TestLLMGenerate:
         k1 = cache_key("model", "prompt", None, {})
         k2 = cache_key("model", "prompt", None, {"n": 3})
         assert k1 != k2
+
+
+# --- Retry on 429 ---
+
+
+class TestRetryOn429:
+    def test_retries_on_rate_limit(self):
+        """429 errors should be retried with backoff, not raised immediately."""
+        import llm_provider.providers.openai_api as oai_mod
+
+        llm = LLM("gpt-4.1-nano")
+
+        mock_cache = MagicMock()
+        mock_cache.get.return_value = None
+        original_cache = oai_mod.direct_cache
+        oai_mod.direct_cache = mock_cache
+
+        # First call raises 429, second succeeds
+        rate_err = Exception("rate limit")
+        rate_err.status_code = 429
+
+        msg = MagicMock()
+        msg.content = "ok"
+        msg.reasoning_content = None
+        choice = MagicMock()
+        choice.message = msg
+        resp = MagicMock()
+        resp.choices = [choice]
+        resp.usage.prompt_tokens = 10
+        resp.usage.completion_tokens = 5
+        resp.usage.prompt_tokens_details = None
+
+        llm._client.chat.completions.create = AsyncMock(side_effect=[rate_err, resp])
+
+        try:
+            results = llm.generate("test", silent=True)
+        finally:
+            oai_mod.direct_cache = original_cache
+
+        assert results == [["ok"]]
+        assert llm._client.chat.completions.create.call_count == 2
+
+    def test_non_429_errors_raise_immediately(self):
+        """Non-rate-limit errors should not be retried."""
+        import llm_provider.providers.openai_api as oai_mod
+
+        llm = LLM("gpt-4.1-nano")
+
+        mock_cache = MagicMock()
+        mock_cache.get.return_value = None
+        original_cache = oai_mod.direct_cache
+        oai_mod.direct_cache = mock_cache
+
+        llm._client.chat.completions.create = AsyncMock(
+            side_effect=ValueError("bad input")
+        )
+
+        try:
+            with pytest.raises(ValueError, match="bad input"):
+                llm.generate("test", silent=True)
+        finally:
+            oai_mod.direct_cache = original_cache
+
+        assert llm._client.chat.completions.create.call_count == 1
+
+
+# --- File-based global semaphore ---
+
+
+class TestFileSlotSemaphore:
+    def test_limits_concurrency(self):
+        """FileSlotSemaphore should limit concurrent access to max_slots."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sem = _FileSlotSemaphore(max_slots=2, lock_dir=tmpdir)
+            active = []
+            max_active = [0]
+
+            async def worker(i):
+                async with sem:
+                    active.append(i)
+                    max_active[0] = max(max_active[0], len(active))
+                    await asyncio.sleep(0.05)
+                    active.remove(i)
+
+            async def run_all():
+                await asyncio.gather(*[worker(i) for i in range(6)])
+
+            asyncio.run(run_all())
+            assert max_active[0] <= 2
+
+    def test_releases_on_exception(self):
+        """Slots should be released even if the task raises."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sem = _FileSlotSemaphore(max_slots=1, lock_dir=tmpdir)
+
+            async def failing():
+                async with sem:
+                    raise RuntimeError("boom")
+
+            async def succeeding():
+                async with sem:
+                    return "ok"
+
+            async def run():
+                with pytest.raises(RuntimeError):
+                    await failing()
+                return await succeeding()
+
+            result = asyncio.run(run())
+            assert result == "ok"

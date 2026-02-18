@@ -65,3 +65,4 @@ Uses litellm conventions:
 - `GEMINI_API_KEY` -- for Gemini models
 - `TOGETHER_API_KEY` -- for Together models
 - `LLM_CACHE_DIR` -- override cache location (default: `/scr/yoonho/llm-cache`, fallback to `/tmp/llm_cache`)
+- `LLM_GLOBAL_CONCURRENCY` -- cross-process concurrency limit via file locks (e.g., `64` for 16 processes sharing a rate limit)
