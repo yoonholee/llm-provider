@@ -68,13 +68,12 @@ class _FileSlotSemaphore:
     Locks auto-release on process crash (OS guarantee).
     """
 
-    def __init__(self, max_slots: int, lock_dir: str = "/tmp"):
+    def __init__(self, max_slots: int, lock_dir: str = "/tmp", namespace: str = ""):
         self._slots = max_slots
         self._dir = Path(lock_dir)
         self._dir.mkdir(parents=True, exist_ok=True)
-        self._paths = [
-            self._dir / f"llm_provider_slot_{i}.lock" for i in range(max_slots)
-        ]
+        prefix = f"llm_provider_{namespace}_" if namespace else "llm_provider_"
+        self._paths = [self._dir / f"{prefix}slot_{i}.lock" for i in range(max_slots)]
         self._held: dict = {}  # task -> fd
 
     async def __aenter__(self):
@@ -87,6 +86,11 @@ class _FileSlotSemaphore:
     async def acquire(self):
         """Block until a slot is available."""
         task = asyncio.current_task()
+        # Release any previously held fd for this task (prevents fd leak on double-acquire)
+        old_fd = self._held.pop(task, None)
+        if old_fd:
+            fcntl.flock(old_fd, fcntl.LOCK_UN)
+            old_fd.close()
         while True:
             for path in self._paths:
                 fd = open(path, "w")
@@ -106,12 +110,22 @@ class _FileSlotSemaphore:
             fd.close()
 
 
+_global_semaphore_cache: _FileSlotSemaphore | None = None
+_global_semaphore_initialized = False
+
+
 def _get_global_semaphore() -> _FileSlotSemaphore | None:
-    """Return a global file-lock semaphore if LLM_GLOBAL_CONCURRENCY is set."""
+    """Return a cached global file-lock semaphore if LLM_GLOBAL_CONCURRENCY is set."""
+    global _global_semaphore_cache, _global_semaphore_initialized
+    if _global_semaphore_initialized:
+        return _global_semaphore_cache
+    _global_semaphore_initialized = True
     val = os.environ.get("LLM_GLOBAL_CONCURRENCY")
     if val:
-        return _FileSlotSemaphore(int(val))
-    return None
+        # Namespace by uid to avoid collisions on shared clusters
+        namespace = str(os.getuid())
+        _global_semaphore_cache = _FileSlotSemaphore(int(val), namespace=namespace)
+    return _global_semaphore_cache
 
 
 # --- Provider detection ---

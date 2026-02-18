@@ -46,6 +46,19 @@ class TestIsRateLimit:
         e.status_code = 500
         assert not _is_rate_limit(e)
 
+    def test_real_gemini_client_error_429(self):
+        """Regression: real google.genai ClientError with code=429 must be detected."""
+        from google.genai.errors import ClientError as GeminiClientError
+
+        e = GeminiClientError(429, "Resource exhausted")
+        assert _is_rate_limit(e)
+
+    def test_real_gemini_client_error_non_429(self):
+        from google.genai.errors import ClientError as GeminiClientError
+
+        e = GeminiClientError(400, "Bad request")
+        assert not _is_rate_limit(e)
+
 
 # --- Provider detection ---
 
@@ -546,3 +559,31 @@ class TestFileSlotSemaphore:
 
             result = asyncio.run(run())
             assert result == "ok"
+
+    def test_namespace_isolation(self):
+        """Different namespaces should use different lock files."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sem_a = _FileSlotSemaphore(max_slots=1, lock_dir=tmpdir, namespace="userA")
+            sem_b = _FileSlotSemaphore(max_slots=1, lock_dir=tmpdir, namespace="userB")
+
+            async def run():
+                # Both should acquire without blocking each other
+                await sem_a.acquire()
+                await sem_b.acquire()
+                sem_a.release()
+                sem_b.release()
+
+            asyncio.run(run())
+
+    def test_double_acquire_releases_old_fd(self):
+        """Double acquire on same task should release the old fd, not leak it."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sem = _FileSlotSemaphore(max_slots=2, lock_dir=tmpdir)
+
+            async def run():
+                await sem.acquire()
+                # Acquire again without releasing — old fd should be cleaned up
+                await sem.acquire()
+                sem.release()
+
+            asyncio.run(run())
