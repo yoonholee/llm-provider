@@ -5,6 +5,7 @@ import fcntl
 import logging
 import os
 import random
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -163,6 +164,16 @@ def _is_rate_limit(exc: Exception) -> bool:
     return False
 
 
+def _parse_retry_after(exc: Exception) -> float | None:
+    """Parse server-suggested retry delay from error message.
+
+    Gemini errors include 'Please retry in 27.39s' in the message.
+    """
+    msg = getattr(exc, "message", None) or str(exc)
+    m = re.search(r"retry in ([\d.]+)s", msg)
+    return float(m.group(1)) if m else None
+
+
 def _run_async(coro):
     try:
         return asyncio.run(coro)
@@ -269,12 +280,18 @@ class LLM:
                     if _is_rate_limit(e):
                         sem.on_rate_limit()
                         if attempt < _MAX_RETRIES:
-                            delay = _BASE_DELAY * (2**attempt) + random.random()
+                            server_delay = _parse_retry_after(e)
+                            backoff = _BASE_DELAY * (2**attempt)
+                            delay = max(server_delay or 0, backoff) + random.uniform(1, 5)
+                            reason = getattr(e, "message", str(e))[:120]
                             log.warning(
-                                "429 rate limit (attempt %d/%d), retrying in %.1fs",
+                                "429 [%s] attempt %d/%d (window=%d) waiting %.0fs | %s",
+                                self.model,
                                 attempt + 1,
                                 _MAX_RETRIES,
+                                sem.window,
                                 delay,
+                                reason,
                             )
                             await asyncio.sleep(delay)
                             continue
