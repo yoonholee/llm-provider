@@ -2,7 +2,15 @@
 
 import time
 
-import litellm
+
+def _litellm():
+    """Lazy import of litellm (saves ~1.5s when using direct SDK paths)."""
+    import litellm
+
+    from llm_provider._cache import _ensure_litellm_cache
+
+    _ensure_litellm_cache()
+    return litellm
 
 
 async def call(
@@ -19,7 +27,7 @@ async def call(
     if kwargs.get("max_completion_tokens") and "temperature" in kwargs:
         kwargs.pop("temperature")
 
-    response = await litellm.acompletion(
+    response = await _litellm().acompletion(
         model=model,
         messages=messages,
         num_retries=max_retries,
@@ -39,7 +47,7 @@ async def call(
         if details:
             usage["cached_tokens"] = getattr(details, "cached_tokens", 0) or 0
     try:
-        usage["cost"] = litellm.completion_cost(completion_response=response)
+        usage["cost"] = _litellm().completion_cost(completion_response=response)
     except Exception:
         pass
 
@@ -53,7 +61,7 @@ async def bench_stream(model: str, messages: list, **kwargs):
     chunks: list[str] = []
     last_chunk = None
 
-    response = await litellm.acompletion(
+    response = await _litellm().acompletion(
         model=model, messages=messages, stream=True, num_retries=1, **kwargs
     )
     async for chunk in response:

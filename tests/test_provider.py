@@ -257,9 +257,11 @@ class TestLLMGenerate:
         mock_response.usage.completion_tokens = 5
         mock_response.usage.prompt_tokens_details = None
 
-        with patch("llm_provider.providers.litellm_api.litellm") as mock_litellm:
-            mock_litellm.acompletion = AsyncMock(return_value=mock_response)
-            mock_litellm.completion_cost.return_value = 0.001
+        with patch("llm_provider.providers.litellm_api._litellm") as mock_litellm:
+            mock_litellm.return_value.acompletion = AsyncMock(
+                return_value=mock_response
+            )
+            mock_litellm.return_value.completion_cost.return_value = 0.001
 
             results = llm.generate("Hi", silent=True)
 
@@ -279,9 +281,11 @@ class TestLLMGenerate:
         mock_response.usage.completion_tokens = 3
         mock_response.usage.prompt_tokens_details = None
 
-        with patch("llm_provider.providers.litellm_api.litellm") as mock_litellm:
-            mock_litellm.acompletion = AsyncMock(return_value=mock_response)
-            mock_litellm.completion_cost.return_value = 0.0
+        with patch("llm_provider.providers.litellm_api._litellm") as mock_litellm:
+            mock_litellm.return_value.acompletion = AsyncMock(
+                return_value=mock_response
+            )
+            mock_litellm.return_value.completion_cost.return_value = 0.0
 
             results = llm.generate("single prompt", silent=True)
 

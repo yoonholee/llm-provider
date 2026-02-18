@@ -15,18 +15,15 @@ litellm is convenient but adds measurable overhead. Benchmarked improvements fro
 
 Other features litellm doesn't give you out of the box:
 - **Disk caching** across all providers (deterministic, SHA-256 keyed)
-- **Async batching** with tuned concurrency (default 32, benchmarked optimal for OpenAI)
-- **Cumulative usage tracking** (input/output/cached tokens, cost via litellm's pricing DB)
+- **Adaptive concurrency** (AIMD: ramps up on success, backs off on 429)
+- **Lazy imports** (0.1s import vs 4s with litellm eager loading)
+- **Cumulative usage tracking** (input/output/cached tokens, cost)
 - **Prefix cache tracking** for OpenAI/Anthropic
 
-## Install
+## Install / upgrade
 
-```toml
-# pyproject.toml
-[project]
-dependencies = [
-    "llm-provider @ git+https://github.com/yoonho/llm-provider",
-]
+```bash
+uv add "llm-provider @ git+https://github.com/yoonho/llm-provider" --upgrade
 ```
 
 ## Usage
@@ -64,4 +61,4 @@ Uses litellm conventions:
 - `OPENAI_API_KEY` -- for OpenAI models
 - `GEMINI_API_KEY` -- for Gemini models
 - `TOGETHER_API_KEY` -- for Together models
-- `LLM_CACHE_DIR` -- override cache location (default: `/iris/u/yoonho/.cache/llm_cache` or `/tmp/llm_cache`)
+- `LLM_CACHE_DIR` -- override cache location (default: `/scr/yoonho/llm-cache`, fallback to `/tmp/llm_cache`)

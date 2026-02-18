@@ -8,8 +8,9 @@ Provider detection: Gemini (`gemini/*`), OpenAI (`gpt-*`, `o1*`, `o3*`, `o4*`, `
 - Together: `AsyncOpenAI(api_key=..., base_url="https://api.together.xyz/v1")` -- default httpx
 - Gemini: `genai.Client(api_key=...)` -- native SDK with streaming
 - Anthropic/others: `litellm.acompletion()` -- litellm is faster than direct SDK for Anthropic
-- All direct paths share `_direct_cache` (FanoutCache, shards=8) for disk caching
+- All direct paths share lazy FanoutCache (shards=8, on /scr NVMe) for disk caching
 - Default `max_concurrent=32` (benchmarked optimal for OpenAI; c=64 triggers rate limiting)
+- Adaptive concurrency via AIMD semaphore: +1 on success, halve on 429
 
 ### What worked
 | Optimization | Impact | Notes |
@@ -60,8 +61,55 @@ Provider detection: Gemini (`gemini/*`), OpenAI (`gpt-*`, `o1*`, `o3*`, `o4*`, `
 - Returns `content=None` for Gemini 3 with thinking enabled (except `thinking_budget=0`)
 - LoggingWorker spams "bound to a different event loop" errors. Harmless noise.
 
+### litellm dependency reduction (2026-02-17)
+- Replaced `litellm.completion_cost()` with own `pricing.cost()` (from `prices.csv`) for all direct SDK paths (OpenAI, Together, Local). litellm is no longer imported by `openai_api.py`.
+- litellm now only used for: (1) Anthropic API calls via `litellm_api.py`, (2) disk cache setup for the litellm fallback path in `_cache.py`.
+- Removed `litellm_model` parameter from `openai_api.call()` -- was only needed for `litellm.completion_cost()`.
+- To fully drop litellm: write a direct Anthropic provider. But direct Anthropic SDK benchmarked slower (636 vs 1051 tok/s), so litellm stays for now.
+
+### Caching design notes
+- `cache_key()`: SHA-256 of `json.dumps(sort_keys=True)`. Correct approach -- deterministic serialization + fixed-size key for compact SQLite index. blake2b would be faster but irrelevant next to API latency.
+- FanoutCache shards=8: docs recommend one shard per concurrent writer. With max_concurrent=32 you could go higher, but cache writes are fast and rarely contend -- 8 is fine. More shards = more file handles + SQLite overhead for negligible benefit.
+- diskcache handles arbitrary-length string keys, so the SHA-256 step isn't strictly necessary, but it keeps index size predictable for long prompts.
+
+### Lazy imports + cache init (2026-02-17)
+
+Import time: 4.2s → 0.12s (35x improvement). Test runtime: 7.2s → 1.1s.
+
+**Root causes of slow import:**
+- `FanoutCache(shards=8)` on NFS: **4.7s** (each shard opens a SQLite DB on NFS)
+- `import litellm`: **1.5s** (pulls in pydantic, httpx, tons of submodules)
+- `import google.genai`: **0.6s**
+- `import openai`: **0.3s**
+
+**Fixes:**
+1. Lazy FanoutCache via `_LazyCache` proxy: init deferred to first `.get()`/`.set()` call
+2. Lazy litellm import: only loaded when litellm fallback path is actually used
+3. google.genai and openai were already lazy (imported inside `create_client()`)
+
+**FanoutCache shards vs NFS init time:** (measured)
+- 8 shards: 4.7s, 4 shards: 1.8s, 2 shards: 0.9s, 1 shard: 0.5s, no shards (Cache): 0.4s
+- On /tmp (local disk): 8 shards = 0.18s. The NFS penalty is ~25x per shard.
+- Switched default cache dir to `/scr/yoonho/llm-cache` (node-local NVMe, ~0.18s init)
+- Kept shards=8 since /scr is fast. Falls back to NFS or /tmp if /scr unavailable.
+
+### Adaptive concurrency / AIMD (2026-02-17)
+
+Replaced fixed `asyncio.Semaphore(max_concurrent)` with AIMD controller.
+- On success: window += 1 (up to max)
+- On 429 RateLimitError: window //= 2 (floor at 4)
+- Throughput: +9% OpenAI, +4% Gemini in benchmarks (within noise, but lower variance)
+- Real value: robustness. Adapts to rate limit changes without manual tuning.
+- Detection: `type(exc).__name__ == "RateLimitError"` or `status_code == 429`
+
+### uvloop (2026-02-17) -- no improvement
+
+Tested uvloop as event loop replacement. Results within noise on Python 3.13:
+- OpenAI: 846 tok/s (baseline 965) -- actually worse
+- Gemini: 775 tok/s (baseline 742) -- marginally better
+Not worth the dependency. The asyncio bottleneck is API latency, not event loop scheduling.
+
 ### Future optimization ideas (not yet implemented)
-- **Adaptive concurrency**: Ramp up on success, halve on 429.
 - **Key rotation**: Round-robin across API keys for Nx rate limit multiplier.
 - **Batch APIs**: OpenAI/Anthropic batch endpoints for offline work (50% cost reduction).
 - **Structured output / JSON mode**: Constrained decoding eliminates retry-on-parse-failure.
