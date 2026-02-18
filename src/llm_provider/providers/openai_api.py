@@ -28,9 +28,10 @@ def create_client(max_retries: int = 2):
 
     from llm_provider.providers._pool import ClientPool
 
-    api_key = os.environ.get("OPENAI_API_KEY", "")
-    keys = [k.strip() for k in api_key.split(",") if k.strip()]
-    if len(keys) > 1:
+    # OPENAI_KEYS: comma-separated list for rotation; OPENAI_API_KEY: single key
+    keys_str = os.environ.get("OPENAI_KEYS")
+    if keys_str:
+        keys = [k.strip() for k in keys_str.split(",") if k.strip()]
         clients = [
             AsyncOpenAI(api_key=k, http_client=httpx.AsyncClient(http2=True), max_retries=max_retries)
             for k in keys

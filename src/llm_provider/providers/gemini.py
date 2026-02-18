@@ -10,10 +10,11 @@ from llm_provider.providers._pool import ClientPool
 def create_client():
     import google.genai as genai
 
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        raise ValueError("GEMINI_API_KEY required for Gemini models")
-    keys = [k.strip() for k in api_key.split(",") if k.strip()]
+    # GEMINI_KEYS: comma-separated list for rotation; GEMINI_API_KEY: single key
+    keys_str = os.environ.get("GEMINI_KEYS") or os.environ.get("GEMINI_API_KEY")
+    if not keys_str:
+        raise ValueError("GEMINI_API_KEY or GEMINI_KEYS required for Gemini models")
+    keys = [k.strip() for k in keys_str.split(",") if k.strip()]
     clients = [genai.Client(api_key=k) for k in keys]
     return ClientPool(clients)
 
