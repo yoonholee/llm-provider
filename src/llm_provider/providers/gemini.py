@@ -1,18 +1,50 @@
 """Gemini provider via native google.genai SDK with streaming."""
 
 import os
+import threading
 import time
 
 from llm_provider._cache import cache_key, direct_cache
 
 
-def create_client():
-    import google.genai as genai
+class _ClientPool:
+    """Round-robin pool of Gemini clients for API key rotation.
 
+    Accepts GEMINI_API_KEY as a single key or comma-separated list.
+    On 429, call rotate() to advance to the next key.
+    """
+
+    def __init__(self, keys: list[str]):
+        import google.genai as genai
+
+        self._clients = [genai.Client(api_key=k.strip()) for k in keys if k.strip()]
+        if not self._clients:
+            raise ValueError("GEMINI_API_KEY required for Gemini models")
+        self._idx = 0
+        self._lock = threading.Lock()
+
+    @property
+    def current(self):
+        return self._clients[self._idx % len(self._clients)]
+
+    def rotate(self):
+        """Advance to the next client. Returns True if there are multiple keys."""
+        if len(self._clients) <= 1:
+            return False
+        with self._lock:
+            self._idx = (self._idx + 1) % len(self._clients)
+        return True
+
+    def __len__(self):
+        return len(self._clients)
+
+
+def create_client():
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise ValueError("GEMINI_API_KEY required for Gemini models")
-    return genai.Client(api_key=api_key)
+    keys = api_key.split(",")
+    return _ClientPool(keys)
 
 
 def model_id(model: str) -> str:
@@ -20,8 +52,11 @@ def model_id(model: str) -> str:
     return model.removeprefix("gemini/")
 
 
-async def call(client, model: str, prompt: str, system_prompt: str = "", **kwargs):
-    """Returns (texts: list[str], usage: dict)."""
+async def call(pool, model: str, prompt: str, system_prompt: str = "", **kwargs):
+    """Returns (texts: list[str], usage: dict).
+
+    pool: _ClientPool (round-robin across API keys).
+    """
     import google.genai.types as types
 
     kwargs = dict(kwargs)
@@ -76,7 +111,7 @@ async def call(client, model: str, prompt: str, system_prompt: str = "", **kwarg
     async def _single_call():
         chunks: list[str] = []
         last_chunk = None
-        async for chunk in await client.aio.models.generate_content_stream(
+        async for chunk in await pool.current.aio.models.generate_content_stream(
             model=mid, contents=prompt, config=config
         ):
             if chunk.text:
@@ -116,7 +151,7 @@ async def call(client, model: str, prompt: str, system_prompt: str = "", **kwarg
     return texts, usage
 
 
-async def bench_stream(client, model: str, messages: list, **kwargs):
+async def bench_stream(pool, model: str, messages: list, **kwargs):
     """Streaming benchmark -> (ttft, total_time, output_tokens)."""
     import google.genai.types as types
 
@@ -150,7 +185,7 @@ async def bench_stream(client, model: str, messages: list, **kwargs):
     chunks: list[str] = []
     last_chunk = None
 
-    async for chunk in await client.aio.models.generate_content_stream(
+    async for chunk in await pool.current.aio.models.generate_content_stream(
         model=mid, contents=prompt, config=config
     ):
         if chunk.text:

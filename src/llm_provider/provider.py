@@ -279,6 +279,10 @@ class LLM:
                 except Exception as e:
                     if _is_rate_limit(e):
                         sem.on_rate_limit()
+                        # Rotate Gemini API key on 429 (if pool has multiple keys)
+                        if _is_gemini(self.model) and hasattr(self._client, "rotate"):
+                            if self._client.rotate():
+                                log.info("429 [%s] rotated to next API key", self.model)
                         if attempt < _MAX_RETRIES:
                             server_delay = _parse_retry_after(e)
                             backoff = _BASE_DELAY * (2**attempt)
