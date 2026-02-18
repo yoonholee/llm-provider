@@ -1,0 +1,19 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd /iris/u/yoonho/llm-provider && uv run --extra dev ruff format --quiet src/ tests/ 2>&1"
+          },
+          {
+            "type": "command",
+            "command": "cd /iris/u/yoonho/llm-provider && uv run --extra dev pytest tests/ -x -q 2>&1 | tail -5"
+          }
+        ]
+      }
+    ]
+  }
+}
