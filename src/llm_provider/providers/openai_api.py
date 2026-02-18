@@ -1,0 +1,141 @@
+"""OpenAI provider via direct SDK with HTTP/2.
+
+Also used by Together and local (OpenAI-compatible API).
+"""
+
+import re
+import time
+
+import httpx
+import litellm
+
+from llm_provider._cache import cache_key, direct_cache
+
+_THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
+_THINK_UNCLOSED_RE = re.compile(r"<think>.*", re.DOTALL)
+
+
+def strip_thinking(text: str) -> str:
+    """Remove <think>...</think> blocks (and unclosed <think>) from model output."""
+    text = _THINK_RE.sub("", text)
+    text = _THINK_UNCLOSED_RE.sub("", text)
+    return text.strip()
+
+
+def create_client(max_retries: int = 2):
+    from openai import AsyncOpenAI
+
+    return AsyncOpenAI(
+        http_client=httpx.AsyncClient(http2=True),
+        max_retries=max_retries,
+    )
+
+
+def model_id(model: str) -> str:
+    """'openai/gpt-4.1-nano' -> 'gpt-4.1-nano'"""
+    return model.removeprefix("openai/")
+
+
+async def call(
+    client,
+    litellm_model: str,
+    model_id: str,
+    prompt: str,
+    system_prompt: str = "",
+    **kwargs,
+):
+    """Returns (texts: list[str], usage: dict).
+
+    litellm_model is the original model string (for cost lookup).
+    model_id is the API-level model name.
+    """
+    kwargs = dict(kwargs)
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+
+    # Reasoning models reject temperature
+    if kwargs.get("max_completion_tokens") and "temperature" in kwargs:
+        kwargs.pop("temperature")
+
+    # Cache lookup -- include all kwargs that affect output
+    config_dict = {k: v for k, v in sorted(kwargs.items()) if v is not None}
+    key = cache_key(model_id, prompt, system_prompt or None, config_dict)
+    cached = direct_cache.get(key)
+    if cached is not None:
+        return [cached], {}
+
+    response = await client.chat.completions.create(
+        model=model_id, messages=messages, **kwargs
+    )
+
+    texts = [c.message.content or "" for c in response.choices]
+    if not texts:
+        texts = [""]
+
+    # Strip <think> blocks when server hasn't already parsed them into
+    # reasoning_content (i.e. vLLM without --enable-reasoning).
+    has_reasoning_field = any(
+        getattr(c.message, "reasoning_content", None) for c in response.choices
+    )
+    if not has_reasoning_field:
+        texts = [strip_thinking(t) if "<think>" in t else t for t in texts]
+    else:
+        texts = [t.strip() for t in texts]
+
+    usage = {}
+    if response.usage:
+        usage["input_tokens"] = response.usage.prompt_tokens or 0
+        usage["output_tokens"] = response.usage.completion_tokens or 0
+        details = getattr(response.usage, "prompt_tokens_details", None)
+        if details:
+            usage["cached_tokens"] = getattr(details, "cached_tokens", 0) or 0
+
+    # Cost via litellm's pricing database
+    try:
+        usage["cost"] = litellm.completion_cost(
+            model=litellm_model,
+            prompt_tokens=response.usage.prompt_tokens if response.usage else 0,
+            completion_tokens=(
+                response.usage.completion_tokens if response.usage else 0
+            ),
+        )
+    except Exception:
+        pass
+
+    if texts[0]:
+        direct_cache.set(key, texts[0])
+    return texts, usage
+
+
+async def bench_stream(client, model_id: str, messages: list, **kwargs):
+    """Streaming benchmark -> (ttft, total_time, output_tokens)."""
+    kwargs = dict(kwargs)
+
+    t0 = time.monotonic()
+    ttft = None
+    chunks: list[str] = []
+
+    stream = await client.chat.completions.create(
+        model=model_id,
+        messages=messages,
+        stream=True,
+        stream_options={"include_usage": True},
+        **kwargs,
+    )
+    last_chunk = None
+    async for chunk in stream:
+        delta = chunk.choices[0].delta.content if chunk.choices else None
+        if delta:
+            if ttft is None:
+                ttft = time.monotonic() - t0
+            chunks.append(delta)
+        last_chunk = chunk
+
+    total = time.monotonic() - t0
+    output_tokens = len("".join(chunks)) // 4
+    if last_chunk and hasattr(last_chunk, "usage") and last_chunk.usage:
+        output_tokens = last_chunk.usage.completion_tokens or output_tokens
+
+    return ttft or total, total, output_tokens

@@ -6,6 +6,7 @@ Usage:
     results = llm.generate(["What is 2+2?", "Name a color."])
 """
 
+from llm_provider.pricing import PRICES, cost
 from llm_provider.provider import LLM
 
-__all__ = ["LLM"]
+__all__ = ["LLM", "PRICES", "cost"]

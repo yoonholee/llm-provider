@@ -1,0 +1,142 @@
+"""Gemini provider via native google.genai SDK with streaming."""
+
+import os
+import time
+
+from llm_provider._cache import cache_key, direct_cache
+
+
+def create_client():
+    import google.genai as genai
+
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY required for Gemini models")
+    return genai.Client(api_key=api_key)
+
+
+def model_id(model: str) -> str:
+    """'gemini/gemini-3-flash-preview' -> 'gemini-3-flash-preview'"""
+    return model.removeprefix("gemini/")
+
+
+async def call(client, model: str, prompt: str, system_prompt: str = "", **kwargs):
+    """Returns (texts: list[str], usage: dict)."""
+    import google.genai.types as types
+
+    kwargs = dict(kwargs)
+    mid = model_id(model)
+
+    # thinking_budget=0 disables thinking (fastest config)
+    thinking_config = kwargs.pop("thinking_config", None)
+    if thinking_config is None:
+        thinking_config = types.ThinkingConfig(thinking_budget=0)
+
+    max_tokens = kwargs.pop("max_tokens", None)
+    if max_tokens is None:
+        max_tokens = kwargs.pop("max_output_tokens", None)
+
+    # Forward remaining kwargs (temperature, top_p, etc.) to config
+    temperature = kwargs.pop("temperature", None)
+    top_p = kwargs.pop("top_p", None)
+
+    config = types.GenerateContentConfig(
+        system_instruction=system_prompt or None,
+        thinking_config=thinking_config,
+        **({"max_output_tokens": max_tokens} if max_tokens is not None else {}),
+        **({"temperature": temperature} if temperature is not None else {}),
+        **({"top_p": top_p} if top_p is not None else {}),
+    )
+
+    # Cache lookup
+    tc_dict = {}
+    if getattr(thinking_config, "thinking_budget", None) is not None:
+        tc_dict["thinking_budget"] = thinking_config.thinking_budget
+    if getattr(thinking_config, "thinking_level", None) is not None:
+        tc_dict["thinking_level"] = str(thinking_config.thinking_level)
+    config_dict = {
+        "thinking": tc_dict,
+        "max_output_tokens": max_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
+        "system": system_prompt or None,
+    }
+    key = cache_key(mid, prompt, system_prompt or None, config_dict)
+    cached = direct_cache.get(key)
+    if cached is not None:
+        return [cached], {}
+
+    # Stream response for lower TTFT
+    chunks: list[str] = []
+    last_chunk = None
+    async for chunk in await client.aio.models.generate_content_stream(
+        model=mid, contents=prompt, config=config
+    ):
+        if chunk.text:
+            chunks.append(chunk.text)
+        last_chunk = chunk
+
+    text = "".join(chunks)
+
+    usage = {}
+    if last_chunk and last_chunk.usage_metadata:
+        meta = last_chunk.usage_metadata
+        usage["input_tokens"] = meta.prompt_token_count or 0
+        usage["output_tokens"] = meta.candidates_token_count or 0
+
+    if text:
+        direct_cache.set(key, text)
+    return [text], usage
+
+
+async def bench_stream(client, model: str, messages: list, **kwargs):
+    """Streaming benchmark -> (ttft, total_time, output_tokens)."""
+    import google.genai.types as types
+
+    kwargs = dict(kwargs)
+    mid = model_id(model)
+
+    thinking_config = kwargs.pop(
+        "thinking_config", types.ThinkingConfig(thinking_budget=0)
+    )
+    max_tokens = kwargs.pop("max_tokens", None)
+    if max_tokens is None:
+        max_tokens = kwargs.pop("max_output_tokens", None)
+    kwargs.pop("temperature", None)
+
+    system_instruction = None
+    prompt = ""
+    for msg in messages:
+        if msg["role"] == "system":
+            system_instruction = msg["content"]
+        elif msg["role"] == "user":
+            prompt = msg["content"]
+
+    config = types.GenerateContentConfig(
+        thinking_config=thinking_config,
+        system_instruction=system_instruction,
+        **({"max_output_tokens": max_tokens} if max_tokens is not None else {}),
+    )
+
+    t0 = time.monotonic()
+    ttft = None
+    chunks: list[str] = []
+    last_chunk = None
+
+    async for chunk in await client.aio.models.generate_content_stream(
+        model=mid, contents=prompt, config=config
+    ):
+        if chunk.text:
+            if ttft is None:
+                ttft = time.monotonic() - t0
+            chunks.append(chunk.text)
+        last_chunk = chunk
+
+    total = time.monotonic() - t0
+    output_tokens = len("".join(chunks)) // 4
+    if last_chunk and last_chunk.usage_metadata:
+        output_tokens = (
+            last_chunk.usage_metadata.candidates_token_count or output_tokens
+        )
+
+    return ttft or total, total, output_tokens

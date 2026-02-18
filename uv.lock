@@ -1060,23 +1060,19 @@ dev = [
     { name = "pytest" },
     { name = "ruff" },
 ]
-together = [
-    { name = "openai" },
-]
 
 [package.metadata]
 requires-dist = [
     { name = "diskcache", specifier = ">=5.6.3" },
-    { name = "google-genai" },
+    { name = "google-genai", specifier = ">=1.63" },
     { name = "httpx", extras = ["http2"] },
-    { name = "litellm" },
+    { name = "litellm", specifier = ">=1.80.9,<1.82" },
     { name = "nest-asyncio" },
-    { name = "openai", specifier = ">=1.0.0" },
-    { name = "openai", marker = "extra == 'together'", specifier = ">=1.0.0" },
+    { name = "openai", specifier = ">=2.21" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
     { name = "ruff", marker = "extra == 'dev'" },
 ]
-provides-extras = ["together", "dev"]
+provides-extras = ["dev"]
 
 [[package]]
 name = "markdown-it-py"

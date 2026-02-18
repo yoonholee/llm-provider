@@ -8,14 +8,13 @@ version = "0.1.0"
 description = "Thin LLM wrapper with disk caching, async batching, and per-provider SDK routing"
 requires-python = ">=3.10"
 dependencies = [
-    "litellm",
+    "litellm>=1.80.9,<1.82",
     "diskcache>=5.6.3",
     "httpx[http2]",
-    "openai>=1.0.0",
-    "google-genai",
+    "openai>=2.21",
+    "google-genai>=1.63",
     "nest-asyncio",
 ]
 
 [project.optional-dependencies]
-together = ["openai>=1.0.0"]
 dev = ["pytest>=7.0", "ruff"]

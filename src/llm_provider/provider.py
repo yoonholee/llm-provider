@@ -1,52 +1,10 @@
-"""Per-provider LLM routing with disk caching and async batching.
-
-Routes to the optimal SDK per provider:
-  - Gemini:   native google.genai SDK (streaming, thinking_budget=0)
-  - OpenAI:   direct SDK with HTTP/2 (~1.5-2x throughput over litellm)
-  - Together:  direct SDK via OpenAI-compatible API (~1.6x over litellm)
-  - All others: litellm fallback (Anthropic, etc.)
-"""
+"""LLM class: per-provider routing with disk caching and async batching."""
 
 import asyncio
-import hashlib
-import json
-import logging
-import os
 import time
-from pathlib import Path
 from typing import Any
 
-import httpx
-import litellm
-from diskcache import FanoutCache
-from litellm.caching.caching import Cache
-
-# Silence noisy loggers
-for name in ("openai", "httpx", "LiteLLM", "LiteLLM Router", "LiteLLM Proxy"):
-    logging.getLogger(name).setLevel(logging.WARNING)
-litellm.suppress_debug_info = True
-
-# Enable disk caching (litellm models only; direct SDK paths use _direct_cache)
-_cache_dir = os.environ.get("LLM_CACHE_DIR", None)
-if _cache_dir is None:
-    candidates = [Path("/iris/u/yoonho/.cache/llm_cache"), Path("/tmp/llm_cache")]
-    _cache_dir = str(next((p for p in candidates if p.parent.exists()), candidates[-1]))
-litellm.cache = Cache(type="disk", disk_cache_dir=_cache_dir)
-
-# Disk cache for all direct SDK paths (Gemini, OpenAI, Together)
-_direct_cache = FanoutCache(str(Path(_cache_dir) / "direct"), shards=8)
-
-
-def _run_async(coro):
-    try:
-        return asyncio.run(coro)
-    except RuntimeError:
-        import nest_asyncio
-
-        nest_asyncio.apply()
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(coro)
-
+from llm_provider.providers import gemini, litellm_api, local, openai_api, together
 
 # --- Provider detection ---
 
@@ -66,28 +24,19 @@ def _is_together(model: str) -> bool:
     return model.startswith("together_ai/")
 
 
-def _gemini_model_id(model: str) -> str:
-    """'gemini/gemini-3-flash-preview' -> 'gemini-3-flash-preview'"""
-    return model.removeprefix("gemini/")
+def _is_local(model: str) -> bool:
+    return model.startswith("local/")
 
 
-def _openai_model_id(model: str) -> str:
-    """'openai/gpt-4.1-nano' -> 'gpt-4.1-nano', 'gpt-4.1-nano' -> 'gpt-4.1-nano'"""
-    return model.removeprefix("openai/")
+def _run_async(coro):
+    try:
+        return asyncio.run(coro)
+    except RuntimeError:
+        import nest_asyncio
 
-
-def _together_model_id(model: str) -> str:
-    """'together_ai/meta-llama/...' -> 'meta-llama/...'"""
-    return model.removeprefix("together_ai/")
-
-
-def _cache_key(model: str, prompt: str, system: str | None, config: dict) -> str:
-    """Deterministic cache key for a direct SDK request."""
-    blob = json.dumps(
-        {"model": model, "prompt": prompt, "system": system, "config": config},
-        sort_keys=True,
-    )
-    return hashlib.sha256(blob.encode()).hexdigest()
+        nest_asyncio.apply()
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(coro)
 
 
 class LLM:
@@ -97,6 +46,7 @@ class LLM:
       - Gemini (gemini/*): native google.genai SDK with streaming
       - OpenAI (gpt-*, o1*, etc.): direct SDK with HTTP/2
       - Together (together_ai/*): direct SDK via OpenAI-compatible API
+      - Local (local/*): OpenAI-compatible API on localhost (vLLM, SGLang, etc.)
       - All others: litellm fallback
 
     Token counts are cumulative across generate() calls.
@@ -112,36 +62,13 @@ class LLM:
         self.total_cost = 0.0
 
         if _is_gemini(model):
-            import google.genai as genai
-
-            api_key = os.environ.get("GEMINI_API_KEY")
-            if not api_key:
-                raise ValueError("GEMINI_API_KEY required for Gemini models")
-            self._genai_client = genai.Client(api_key=api_key)
-
+            self._client = gemini.create_client()
         elif _is_openai(model):
-            from openai import AsyncOpenAI
-
-            self._openai_client = AsyncOpenAI(
-                http_client=httpx.AsyncClient(http2=True),
-                max_retries=max_retries,
-            )
-
+            self._client = openai_api.create_client(max_retries=max_retries)
         elif _is_together(model):
-            from openai import AsyncOpenAI
-
-            api_key = os.environ.get("TOGETHER_API_KEY") or os.environ.get(
-                "TOGETHERAI_API_KEY"
-            )
-            if not api_key:
-                raise ValueError(
-                    "TOGETHER_API_KEY required for Together models (direct SDK)"
-                )
-            self._together_client = AsyncOpenAI(
-                api_key=api_key,
-                base_url="https://api.together.xyz/v1",
-                max_retries=max_retries,
-            )
+            self._client = together.create_client(max_retries=max_retries)
+        elif _is_local(model):
+            self._client = local.create_client(max_retries=max_retries)
 
     def generate(
         self,
@@ -153,22 +80,28 @@ class LLM:
         """Generate completions. Returns list of response lists (one per prompt)."""
         prompt_list = [prompts] if isinstance(prompts, str) else prompts
 
+        out_before = self.total_output_tokens
+        in_before = self.total_input_tokens
+        cached_before = self.total_cached_tokens
+        cost_before = self.total_cost
+
         t0 = time.monotonic()
         results = _run_async(
             self._batch(prompt_list, system_prompt or "", silent, **kwargs)
         )
         elapsed = time.monotonic() - t0
 
-        if not silent and self.total_output_tokens > 0:
-            tps = self.total_output_tokens / elapsed if elapsed > 0 else 0
-            cost_str = f" ${self.total_cost:.4f}" if self.total_cost > 0 else ""
-            cache_str = (
-                f" ({self.total_cached_tokens} cached)"
-                if self.total_cached_tokens > 0
-                else ""
-            )
+        call_out = self.total_output_tokens - out_before
+        call_in = self.total_input_tokens - in_before
+        call_cached = self.total_cached_tokens - cached_before
+        call_cost = self.total_cost - cost_before
+
+        if not silent and call_out > 0:
+            tps = call_out / elapsed if elapsed > 0 else 0
+            cost_str = f" ${call_cost:.4f}" if call_cost > 0 else ""
+            cache_str = f" ({call_cached} cached)" if call_cached > 0 else ""
             print(
-                f"  {self.total_input_tokens} in{cache_str} | {self.total_output_tokens} out |{cost_str} {tps:.0f} tok/s"
+                f"  {call_in} in{cache_str} | {call_out} out |{cost_str} {tps:.0f} tok/s"
             )
 
         return results
@@ -180,209 +113,52 @@ class LLM:
 
         async def run_one(prompt: str) -> list[str]:
             async with sem:
-                if _is_gemini(self.model):
-                    return await self._call_gemini(prompt, system_prompt, **kwargs)
-                if _is_openai(self.model):
-                    return await self._call_openai(prompt, system_prompt, **kwargs)
-                if _is_together(self.model):
-                    return await self._call_together(prompt, system_prompt, **kwargs)
-                return await self._call_litellm(prompt, system_prompt, **kwargs)
+                return await self._call(prompt, system_prompt, **kwargs)
 
         tasks = [run_one(p) for p in prompts]
         return await asyncio.gather(*tasks)
 
-    # --- Gemini native SDK path (streaming) ---
-
-    async def _call_gemini(
-        self, prompt: str, system_prompt: str = "", **kwargs
-    ) -> list[str]:
-        import google.genai.types as types
-
-        kwargs = dict(kwargs)  # don't mutate shared dict across concurrent calls
-        model_id = _gemini_model_id(self.model)
-
-        # Gemini 3: thinking_budget=0 disables thinking (faster than thinking_level=MINIMAL).
-        # Don't set temperature for Gemini 3 -- default 1.0 is optimal, lower causes loops.
-        thinking_config = kwargs.pop("thinking_config", None)
-        if thinking_config is None:
-            thinking_config = types.ThinkingConfig(thinking_budget=0)
-
-        max_tokens = kwargs.pop("max_tokens", None)
-        if max_tokens is None:
-            max_tokens = kwargs.pop("max_output_tokens", None)
-
-        config = types.GenerateContentConfig(
-            system_instruction=system_prompt or None,
-            thinking_config=thinking_config,
-            **({"max_output_tokens": max_tokens} if max_tokens is not None else {}),
-        )
-
-        # Cache lookup
-        tc_dict = {}
-        if getattr(thinking_config, "thinking_budget", None) is not None:
-            tc_dict["thinking_budget"] = thinking_config.thinking_budget
-        if getattr(thinking_config, "thinking_level", None) is not None:
-            tc_dict["thinking_level"] = str(thinking_config.thinking_level)
-        config_dict = {
-            "thinking": tc_dict,
-            "max_output_tokens": max_tokens,
-            "system": system_prompt or None,
-        }
-        cache_key = _cache_key(model_id, prompt, system_prompt or None, config_dict)
-        cached = _direct_cache.get(cache_key)
-        if cached is not None:
-            return [cached]
-
-        # Stream response for lower TTFT
-        chunks: list[str] = []
-        last_chunk = None
-        async for chunk in await self._genai_client.aio.models.generate_content_stream(
-            model=model_id,
-            contents=prompt,
-            config=config,
-        ):
-            if chunk.text:
-                chunks.append(chunk.text)
-            last_chunk = chunk
-
-        text = "".join(chunks)
-
-        # Usage tracking from the last chunk
-        if last_chunk and last_chunk.usage_metadata:
-            meta = last_chunk.usage_metadata
-            self.total_input_tokens += meta.prompt_token_count or 0
-            self.total_output_tokens += meta.candidates_token_count or 0
-
-        if text:
-            _direct_cache.set(cache_key, text)
-        return [text]
-
-    # --- OpenAI-compatible direct SDK path (OpenAI, Together) ---
-
-    async def _call_openai_compat(
-        self,
-        client,
-        model_id: str,
-        prompt: str,
-        system_prompt: str = "",
-        **kwargs,
-    ) -> list[str]:
-        """Shared implementation for OpenAI-compatible APIs (OpenAI, Together)."""
-        kwargs = dict(kwargs)  # don't mutate shared dict across concurrent calls
-        messages = []
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": prompt})
-
-        # Reasoning models (e.g. gpt-5-mini) reject temperature
-        if kwargs.get("max_completion_tokens") and "temperature" in kwargs:
-            kwargs.pop("temperature")
-
-        # Cache lookup
-        config_dict = {}
-        for k in ("temperature", "max_tokens", "max_completion_tokens", "top_p"):
-            if k in kwargs and kwargs[k] is not None:
-                config_dict[k] = kwargs[k]
-        key = _cache_key(model_id, prompt, system_prompt or None, config_dict)
-        cached = _direct_cache.get(key)
-        if cached is not None:
-            return [cached]
-
-        response = await client.chat.completions.create(
-            model=model_id,
-            messages=messages,
-            **kwargs,
-        )
-
-        texts = [c.message.content or "" for c in response.choices]
-        if not texts:
-            texts = [""]
-
-        if response.usage:
-            self.total_input_tokens += response.usage.prompt_tokens or 0
-            self.total_output_tokens += response.usage.completion_tokens or 0
-            # Track prefix caching (OpenAI returns cached_tokens in prompt_tokens_details)
-            details = getattr(response.usage, "prompt_tokens_details", None)
-            if details:
-                self.total_cached_tokens += getattr(details, "cached_tokens", 0) or 0
-
-        # Cost via litellm's pricing database
-        try:
-            self.total_cost += litellm.completion_cost(
-                model=self.model,
-                prompt_tokens=response.usage.prompt_tokens if response.usage else 0,
-                completion_tokens=(
-                    response.usage.completion_tokens if response.usage else 0
-                ),
+    async def _call(self, prompt: str, system_prompt: str, **kwargs) -> list[str]:
+        if _is_gemini(self.model):
+            texts, usage = await gemini.call(
+                self._client, self.model, prompt, system_prompt, **kwargs
             )
-        except Exception:
-            pass
+        elif _is_openai(self.model):
+            texts, usage = await openai_api.call(
+                self._client,
+                self.model,
+                openai_api.model_id(self.model),
+                prompt,
+                system_prompt,
+                **kwargs,
+            )
+        elif _is_together(self.model):
+            texts, usage = await openai_api.call(
+                self._client,
+                self.model,
+                together.model_id(self.model),
+                prompt,
+                system_prompt,
+                **kwargs,
+            )
+        elif _is_local(self.model):
+            texts, usage = await openai_api.call(
+                self._client,
+                self.model,
+                local.model_id(self.model),
+                prompt,
+                system_prompt,
+                **kwargs,
+            )
+        else:
+            texts, usage = await litellm_api.call(
+                self.model, prompt, system_prompt, self.max_retries, **kwargs
+            )
 
-        if texts[0]:
-            _direct_cache.set(key, texts[0])
-        return texts
-
-    async def _call_openai(
-        self, prompt: str, system_prompt: str = "", **kwargs
-    ) -> list[str]:
-        return await self._call_openai_compat(
-            self._openai_client,
-            _openai_model_id(self.model),
-            prompt,
-            system_prompt,
-            **kwargs,
-        )
-
-    async def _call_together(
-        self, prompt: str, system_prompt: str = "", **kwargs
-    ) -> list[str]:
-        return await self._call_openai_compat(
-            self._together_client,
-            _together_model_id(self.model),
-            prompt,
-            system_prompt,
-            **kwargs,
-        )
-
-    # --- litellm fallback path (Anthropic and everything else) ---
-
-    async def _call_litellm(
-        self, prompt: str, system_prompt: str = "", **kwargs
-    ) -> list[str]:
-        kwargs = dict(kwargs)  # don't mutate shared dict across concurrent calls
-        messages = []
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": prompt})
-
-        # Reasoning models (e.g. gpt-5-mini) reject temperature
-        if kwargs.get("max_completion_tokens") and "temperature" in kwargs:
-            kwargs.pop("temperature")
-
-        response = await litellm.acompletion(
-            model=self.model,
-            messages=messages,
-            num_retries=self.max_retries,
-            caching=True,
-            **kwargs,
-        )
-
-        texts = [c.message.content or "" for c in response.choices]
-        if not texts:
-            texts = [""]
-
-        if response.usage:
-            self.total_input_tokens += response.usage.prompt_tokens or 0
-            self.total_output_tokens += response.usage.completion_tokens or 0
-            # Track prefix caching (litellm passes through provider's cached token info)
-            details = getattr(response.usage, "prompt_tokens_details", None)
-            if details:
-                self.total_cached_tokens += getattr(details, "cached_tokens", 0) or 0
-        try:
-            self.total_cost += litellm.completion_cost(completion_response=response)
-        except Exception:
-            pass
-
+        self.total_input_tokens += usage.get("input_tokens", 0)
+        self.total_output_tokens += usage.get("output_tokens", 0)
+        self.total_cached_tokens += usage.get("cached_tokens", 0)
+        self.total_cost += usage.get("cost", 0.0)
         return texts
 
 
@@ -398,136 +174,18 @@ def _median(xs: list[float]) -> float:
 async def _bench_one_stream(model: str, messages: list, *, clients=None, **kwargs):
     """Single streaming request -> (ttft, total_time, output_tokens)."""
     clients = clients or {}
-    if _is_gemini(model):
-        return await _bench_one_stream_gemini(
-            model, messages, _client=clients.get("gemini"), **kwargs
-        )
+    if _is_gemini(model) and "gemini" in clients:
+        return await gemini.bench_stream(clients["gemini"], model, messages, **kwargs)
     if _is_openai(model) and "openai" in clients:
-        return await _bench_one_stream_openai_compat(
-            _openai_model_id(model), messages, _client=clients["openai"], **kwargs
+        return await openai_api.bench_stream(
+            clients["openai"], openai_api.model_id(model), messages, **kwargs
         )
     if _is_together(model) and "together" in clients:
-        return await _bench_one_stream_openai_compat(
-            _together_model_id(model), messages, _client=clients["together"], **kwargs
+        return await openai_api.bench_stream(
+            clients["together"], together.model_id(model), messages, **kwargs
         )
-    return await _bench_one_stream_litellm(model, messages, **kwargs)
-
-
-async def _bench_one_stream_litellm(model: str, messages: list, **kwargs):
-    """litellm streaming benchmark."""
-    t0 = time.monotonic()
-    ttft = None
-    chunks: list[str] = []
-    last_chunk = None
-
-    response = await litellm.acompletion(
-        model=model, messages=messages, stream=True, num_retries=1, **kwargs
-    )
-    async for chunk in response:
-        delta = chunk.choices[0].delta.content if chunk.choices else None
-        if delta:
-            if ttft is None:
-                ttft = time.monotonic() - t0
-            chunks.append(delta)
-        last_chunk = chunk
-
-    total = time.monotonic() - t0
-
-    output_tokens = len("".join(chunks)) // 4
-    if last_chunk and hasattr(last_chunk, "usage") and last_chunk.usage:
-        output_tokens = last_chunk.usage.completion_tokens or output_tokens
-
-    return ttft or total, total, output_tokens
-
-
-async def _bench_one_stream_gemini(
-    model: str, messages: list, *, _client=None, **kwargs
-):
-    """Native google.genai streaming benchmark."""
-    import google.genai.types as types
-
-    kwargs = dict(kwargs)  # don't mutate shared dict
-    client = _client
-    model_id = _gemini_model_id(model)
-
-    thinking_config = kwargs.pop(
-        "thinking_config", types.ThinkingConfig(thinking_budget=0)
-    )
-    max_tokens = kwargs.pop("max_tokens", None)
-    if max_tokens is None:
-        max_tokens = kwargs.pop("max_output_tokens", None)
-    kwargs.pop("temperature", None)
-
-    system_instruction = None
-    prompt = ""
-    for msg in messages:
-        if msg["role"] == "system":
-            system_instruction = msg["content"]
-        elif msg["role"] == "user":
-            prompt = msg["content"]
-
-    config = types.GenerateContentConfig(
-        thinking_config=thinking_config,
-        system_instruction=system_instruction,
-        **({"max_output_tokens": max_tokens} if max_tokens is not None else {}),
-    )
-
-    t0 = time.monotonic()
-    ttft = None
-    chunks: list[str] = []
-    last_chunk = None
-
-    async for chunk in await client.aio.models.generate_content_stream(
-        model=model_id,
-        contents=prompt,
-        config=config,
-    ):
-        if chunk.text:
-            if ttft is None:
-                ttft = time.monotonic() - t0
-            chunks.append(chunk.text)
-        last_chunk = chunk
-
-    total = time.monotonic() - t0
-
-    output_tokens = len("".join(chunks)) // 4
-    if last_chunk and last_chunk.usage_metadata:
-        output_tokens = (
-            last_chunk.usage_metadata.candidates_token_count or output_tokens
+    if _is_local(model) and "local" in clients:
+        return await openai_api.bench_stream(
+            clients["local"], local.model_id(model), messages, **kwargs
         )
-
-    return ttft or total, total, output_tokens
-
-
-async def _bench_one_stream_openai_compat(
-    model_id: str, messages: list, *, _client=None, **kwargs
-):
-    """Streaming benchmark for OpenAI-compatible APIs (OpenAI, Together)."""
-    kwargs = dict(kwargs)  # don't mutate shared dict
-
-    t0 = time.monotonic()
-    ttft = None
-    chunks: list[str] = []
-
-    stream = await _client.chat.completions.create(
-        model=model_id,
-        messages=messages,
-        stream=True,
-        stream_options={"include_usage": True},
-        **kwargs,
-    )
-    last_chunk = None
-    async for chunk in stream:
-        delta = chunk.choices[0].delta.content if chunk.choices else None
-        if delta:
-            if ttft is None:
-                ttft = time.monotonic() - t0
-            chunks.append(delta)
-        last_chunk = chunk
-
-    total = time.monotonic() - t0
-    output_tokens = len("".join(chunks)) // 4
-    if last_chunk and hasattr(last_chunk, "usage") and last_chunk.usage:
-        output_tokens = last_chunk.usage.completion_tokens or output_tokens
-
-    return ttft or total, total, output_tokens
+    return await litellm_api.bench_stream(model, messages, **kwargs)
