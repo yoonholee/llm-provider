@@ -404,3 +404,150 @@ class LLM:
 
         return texts
 
+
+# --- Benchmark helpers ---
+
+
+def _median(xs: list[float]) -> float:
+    s = sorted(xs)
+    n = len(s)
+    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+
+
+async def _bench_one_stream(model: str, messages: list, *, clients=None, **kwargs):
+    """Single streaming request -> (ttft, total_time, output_tokens)."""
+    clients = clients or {}
+    if _is_gemini(model):
+        return await _bench_one_stream_gemini(
+            model, messages, _client=clients.get("gemini"), **kwargs
+        )
+    if _is_openai(model) and "openai" in clients:
+        return await _bench_one_stream_openai_compat(
+            _openai_model_id(model), messages, _client=clients["openai"], **kwargs
+        )
+    if _is_together(model) and "together" in clients:
+        return await _bench_one_stream_openai_compat(
+            _together_model_id(model), messages, _client=clients["together"], **kwargs
+        )
+    return await _bench_one_stream_litellm(model, messages, **kwargs)
+
+
+async def _bench_one_stream_litellm(model: str, messages: list, **kwargs):
+    """litellm streaming benchmark."""
+    t0 = time.monotonic()
+    ttft = None
+    chunks: list[str] = []
+    last_chunk = None
+
+    response = await litellm.acompletion(
+        model=model, messages=messages, stream=True, num_retries=1, **kwargs
+    )
+    async for chunk in response:
+        delta = chunk.choices[0].delta.content if chunk.choices else None
+        if delta:
+            if ttft is None:
+                ttft = time.monotonic() - t0
+            chunks.append(delta)
+        last_chunk = chunk
+
+    total = time.monotonic() - t0
+
+    output_tokens = len("".join(chunks)) // 4
+    if last_chunk and hasattr(last_chunk, "usage") and last_chunk.usage:
+        output_tokens = last_chunk.usage.completion_tokens or output_tokens
+
+    return ttft or total, total, output_tokens
+
+
+async def _bench_one_stream_gemini(
+    model: str, messages: list, *, _client=None, **kwargs
+):
+    """Native google.genai streaming benchmark."""
+    import google.genai.types as types
+
+    kwargs = dict(kwargs)  # don't mutate shared dict
+    client = _client
+    model_id = _gemini_model_id(model)
+
+    thinking_config = kwargs.pop(
+        "thinking_config", types.ThinkingConfig(thinking_budget=0)
+    )
+    max_tokens = kwargs.pop("max_tokens", None)
+    if max_tokens is None:
+        max_tokens = kwargs.pop("max_output_tokens", None)
+    kwargs.pop("temperature", None)
+
+    system_instruction = None
+    prompt = ""
+    for msg in messages:
+        if msg["role"] == "system":
+            system_instruction = msg["content"]
+        elif msg["role"] == "user":
+            prompt = msg["content"]
+
+    config = types.GenerateContentConfig(
+        thinking_config=thinking_config,
+        system_instruction=system_instruction,
+        **({"max_output_tokens": max_tokens} if max_tokens is not None else {}),
+    )
+
+    t0 = time.monotonic()
+    ttft = None
+    chunks: list[str] = []
+    last_chunk = None
+
+    async for chunk in await client.aio.models.generate_content_stream(
+        model=model_id,
+        contents=prompt,
+        config=config,
+    ):
+        if chunk.text:
+            if ttft is None:
+                ttft = time.monotonic() - t0
+            chunks.append(chunk.text)
+        last_chunk = chunk
+
+    total = time.monotonic() - t0
+
+    output_tokens = len("".join(chunks)) // 4
+    if last_chunk and last_chunk.usage_metadata:
+        output_tokens = (
+            last_chunk.usage_metadata.candidates_token_count or output_tokens
+        )
+
+    return ttft or total, total, output_tokens
+
+
+async def _bench_one_stream_openai_compat(
+    model_id: str, messages: list, *, _client=None, **kwargs
+):
+    """Streaming benchmark for OpenAI-compatible APIs (OpenAI, Together)."""
+    kwargs = dict(kwargs)  # don't mutate shared dict
+
+    t0 = time.monotonic()
+    ttft = None
+    chunks: list[str] = []
+
+    stream = await _client.chat.completions.create(
+        model=model_id,
+        messages=messages,
+        stream=True,
+        stream_options={"include_usage": True},
+        **kwargs,
+    )
+    last_chunk = None
+    async for chunk in stream:
+        delta = chunk.choices[0].delta.content if chunk.choices else None
+        if delta:
+            if ttft is None:
+                ttft = time.monotonic() - t0
+            chunks.append(delta)
+        last_chunk = chunk
+
+    total = time.monotonic() - t0
+    output_tokens = len("".join(chunks)) // 4
+    if last_chunk and hasattr(last_chunk, "usage") and last_chunk.usage:
+        output_tokens = last_chunk.usage.completion_tokens or output_tokens
+
+    return ttft or total, total, output_tokens
+
