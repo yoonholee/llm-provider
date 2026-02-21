@@ -63,3 +63,11 @@ def cache_key(model: str, prompt: str, system: str | None, config: dict) -> str:
         sort_keys=True,
     )
     return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def cache_key_messages(model: str, messages: list, config: dict) -> str:
+    blob = json.dumps(
+        {"model": model, "messages": messages, "config": config},
+        sort_keys=True,
+    )
+    return hashlib.sha256(blob.encode()).hexdigest()

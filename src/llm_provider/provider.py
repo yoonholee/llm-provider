@@ -10,7 +10,14 @@ import time
 from pathlib import Path
 from typing import Any
 
-from llm_provider.providers import gemini, litellm_api, local, openai_api, together
+from llm_provider.providers import (
+    gemini,
+    litellm_api,
+    local,
+    openai_api,
+    sambanova,
+    together,
+)
 
 log = logging.getLogger(__name__)
 
@@ -151,6 +158,10 @@ def _is_local(model: str) -> bool:
     return model.startswith("local/")
 
 
+def _is_sambanova(model: str) -> bool:
+    return model.startswith("sambanova/")
+
+
 def _is_rate_limit(exc: Exception) -> bool:
     """Check if an exception is a 429 rate limit error."""
     # OpenAI SDK
@@ -193,9 +204,10 @@ class LLM:
       - OpenAI (gpt-*, o1*, etc.): direct SDK with HTTP/2
       - Together (together_ai/*): direct SDK via OpenAI-compatible API
       - Local (local/*): OpenAI-compatible API on localhost (vLLM, SGLang, etc.)
+      - SambaNova (sambanova/*): OpenAI-compatible API
       - All others: litellm fallback
 
-    Token counts are cumulative across generate() calls.
+    Token counts are cumulative across generate() and chat() calls.
     """
 
     def __init__(self, model: str, max_concurrent: int = 32, max_retries: int = 2):
@@ -206,6 +218,7 @@ class LLM:
         self.total_output_tokens = 0
         self.total_cached_tokens = 0
         self.total_cost = 0.0
+        self._sync_client = None
 
         if _is_gemini(model):
             self._client = gemini.create_client()
@@ -215,6 +228,8 @@ class LLM:
             self._client = together.create_client(max_retries=max_retries)
         elif _is_local(model):
             self._client = local.create_client(max_retries=max_retries)
+        elif _is_sambanova(model):
+            self._client = sambanova.create_client(max_retries=max_retries)
 
     def generate(
         self,
@@ -286,7 +301,9 @@ class LLM:
                         if attempt < _MAX_RETRIES:
                             server_delay = _parse_retry_after(e)
                             backoff = _BASE_DELAY * (2**attempt)
-                            delay = max(server_delay or 0, backoff) + random.uniform(1, 5)
+                            delay = max(server_delay or 0, backoff) + random.uniform(
+                                1, 5
+                            )
                             reason = getattr(e, "message", str(e))[:120]
                             log.warning(
                                 "429 [%s] attempt %d/%d (window=%d) waiting %.0fs | %s",
@@ -337,6 +354,14 @@ class LLM:
                 system_prompt,
                 **kwargs,
             )
+        elif _is_sambanova(self.model):
+            texts, usage = await openai_api.call(
+                self._client,
+                sambanova.model_id(self.model),
+                prompt,
+                system_prompt,
+                **kwargs,
+            )
         else:
             texts, usage = await litellm_api.call(
                 self.model, prompt, system_prompt, self.max_retries, **kwargs
@@ -347,6 +372,144 @@ class LLM:
         self.total_cached_tokens += usage.get("cached_tokens", 0)
         self.total_cost += usage.get("cost", 0.0)
         return texts
+
+    # --- chat() — sync, messages-based ---
+
+    def chat(
+        self,
+        messages: list[dict[str, str]],
+        cache: bool = True,
+        silent: bool = False,
+        **kwargs: Any,
+    ) -> str:
+        """Chat completion with full message history. Returns response string.
+
+        Fully synchronous — no asyncio/nest_asyncio needed.
+        Supports disk caching (hashes full messages list as cache key).
+
+        Args:
+            messages: List of {"role": ..., "content": ...} dicts.
+            cache: Whether to use disk cache (default True).
+            silent: If False, prints usage stats.
+        """
+        if not cache:
+            kwargs["cache"] = False
+
+        out_before = self.total_output_tokens
+        in_before = self.total_input_tokens
+        cached_before = self.total_cached_tokens
+        cost_before = self.total_cost
+
+        t0 = time.monotonic()
+
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                texts, usage = self._call_messages_sync(messages, **kwargs)
+                self.total_input_tokens += usage.get("input_tokens", 0)
+                self.total_output_tokens += usage.get("output_tokens", 0)
+                self.total_cached_tokens += usage.get("cached_tokens", 0)
+                self.total_cost += usage.get("cost", 0.0)
+                break
+            except Exception as e:
+                if _is_rate_limit(e) and attempt < _MAX_RETRIES:
+                    if hasattr(self, "_client") and hasattr(self._client, "rotate"):
+                        if self._client.rotate():
+                            log.info("429 [%s] rotated to next API key", self.model)
+                    server_delay = _parse_retry_after(e)
+                    backoff = _BASE_DELAY * (2**attempt)
+                    delay = max(server_delay or 0, backoff) + random.uniform(1, 5)
+                    reason = getattr(e, "message", str(e))[:120]
+                    log.warning(
+                        "429 [%s] chat attempt %d/%d waiting %.0fs | %s",
+                        self.model,
+                        attempt + 1,
+                        _MAX_RETRIES,
+                        delay,
+                        reason,
+                    )
+                    time.sleep(delay)
+                    continue
+                raise
+
+        elapsed = time.monotonic() - t0
+
+        call_out = self.total_output_tokens - out_before
+        call_in = self.total_input_tokens - in_before
+        call_cached = self.total_cached_tokens - cached_before
+        call_cost = self.total_cost - cost_before
+
+        if not silent and call_out > 0:
+            tps = call_out / elapsed if elapsed > 0 else 0
+            cost_str = f" ${call_cost:.4f}" if call_cost > 0 else ""
+            cache_str = f" ({call_cached} cached)" if call_cached > 0 else ""
+            print(
+                f"  {call_in} in{cache_str} | {call_out} out |{cost_str} {tps:.0f} tok/s"
+            )
+
+        return texts[0]
+
+    def _get_sync_client(self):
+        """Lazy-create sync client on first chat() call."""
+        if self._sync_client is not None:
+            return self._sync_client
+        if _is_openai(self.model):
+            self._sync_client = openai_api.create_sync_client(
+                max_retries=self.max_retries
+            )
+        elif _is_together(self.model):
+            self._sync_client = together.create_sync_client(
+                max_retries=self.max_retries
+            )
+        elif _is_local(self.model):
+            self._sync_client = local.create_sync_client(max_retries=self.max_retries)
+        elif _is_sambanova(self.model):
+            self._sync_client = sambanova.create_sync_client(
+                max_retries=self.max_retries
+            )
+        # Gemini: reuse self._client (has sync methods via .models)
+        # litellm: no client needed (module-level functions)
+        return self._sync_client
+
+    def _call_messages_sync(
+        self, messages: list[dict], **kwargs
+    ) -> tuple[list[str], dict]:
+        """Dispatch to provider-specific sync call_messages."""
+        if _is_gemini(self.model):
+            return gemini.call_messages_sync(
+                self._client, self.model, messages, **kwargs
+            )
+        elif _is_openai(self.model):
+            return openai_api.call_messages_sync(
+                self._get_sync_client(),
+                openai_api.model_id(self.model),
+                messages,
+                **kwargs,
+            )
+        elif _is_together(self.model):
+            return openai_api.call_messages_sync(
+                self._get_sync_client(),
+                together.model_id(self.model),
+                messages,
+                **kwargs,
+            )
+        elif _is_local(self.model):
+            return openai_api.call_messages_sync(
+                self._get_sync_client(),
+                local.model_id(self.model),
+                messages,
+                **kwargs,
+            )
+        elif _is_sambanova(self.model):
+            return openai_api.call_messages_sync(
+                self._get_sync_client(),
+                sambanova.model_id(self.model),
+                messages,
+                **kwargs,
+            )
+        else:
+            return litellm_api.call_messages_sync(
+                self.model, messages, self.max_retries, **kwargs
+            )
 
 
 # --- Benchmark helpers ---
@@ -374,5 +537,9 @@ async def _bench_one_stream(model: str, messages: list, *, clients=None, **kwarg
     if _is_local(model) and "local" in clients:
         return await openai_api.bench_stream(
             clients["local"], local.model_id(model), messages, **kwargs
+        )
+    if _is_sambanova(model) and "sambanova" in clients:
+        return await openai_api.bench_stream(
+            clients["sambanova"], sambanova.model_id(model), messages, **kwargs
         )
     return await litellm_api.bench_stream(model, messages, **kwargs)

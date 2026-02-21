@@ -481,7 +481,10 @@ class TestRetryOn429:
         resp.usage.completion_tokens = 5
         resp.usage.prompt_tokens_details = None
 
-        llm._client.chat.completions.create = AsyncMock(side_effect=[rate_err, resp])
+        # Replace _client entirely so key rotation can't escape to unmocked clients
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(side_effect=[rate_err, resp])
+        llm._client = mock_client
 
         try:
             results = llm.generate("test", silent=True)
@@ -489,7 +492,7 @@ class TestRetryOn429:
             oai_mod.direct_cache = original_cache
 
         assert results == [["ok"]]
-        assert llm._client.chat.completions.create.call_count == 2
+        assert mock_client.chat.completions.create.call_count == 2
 
     def test_non_429_errors_raise_immediately(self):
         """Non-rate-limit errors should not be retried."""
@@ -587,3 +590,320 @@ class TestFileSlotSemaphore:
                 sem.release()
 
             asyncio.run(run())
+
+
+# --- SambaNova provider ---
+
+
+class TestSambaNovaProvider:
+    def test_detection(self):
+        from llm_provider.provider import _is_sambanova
+
+        assert _is_sambanova("sambanova/Meta-Llama-3.3-70B-Instruct")
+        assert _is_sambanova("sambanova/DeepSeek-R1")
+        assert not _is_sambanova("together_ai/meta-llama/Llama-3-8b")
+        assert not _is_sambanova("gpt-4.1-nano")
+        assert not _is_sambanova("gemini/gemini-3-flash-preview")
+
+    def test_model_id(self):
+        from llm_provider.providers import sambanova
+
+        assert (
+            sambanova.model_id("sambanova/Meta-Llama-3.3-70B-Instruct")
+            == "Meta-Llama-3.3-70B-Instruct"
+        )
+
+    def test_requires_api_key(self):
+        with patch.dict("os.environ", {}, clear=True):
+            with pytest.raises(ValueError, match="SAMBANOVA_API_KEY"):
+                LLM("sambanova/Meta-Llama-3.3-70B-Instruct")
+
+    def test_creates_client(self):
+        with patch.dict("os.environ", {"SAMBANOVA_API_KEY": "test-key"}):
+            llm = LLM("sambanova/Meta-Llama-3.3-70B-Instruct")
+            assert hasattr(llm, "_client")
+
+
+# --- Chat cache key ---
+
+
+class TestChatCacheKey:
+    def test_deterministic(self):
+        from llm_provider._cache import cache_key_messages
+
+        msgs = [{"role": "user", "content": "hello"}]
+        k1 = cache_key_messages("model", msgs, {})
+        k2 = cache_key_messages("model", msgs, {})
+        assert k1 == k2
+
+    def test_differs_from_prompt_key(self):
+        """Messages cache key must differ from single-prompt cache key."""
+        from llm_provider._cache import cache_key_messages
+
+        msg_key = cache_key_messages(
+            "model", [{"role": "user", "content": "hello"}], {}
+        )
+        prompt_key = cache_key("model", "hello", None, {})
+        assert msg_key != prompt_key
+
+    def test_different_messages(self):
+        from llm_provider._cache import cache_key_messages
+
+        k1 = cache_key_messages("model", [{"role": "user", "content": "a"}], {})
+        k2 = cache_key_messages("model", [{"role": "user", "content": "b"}], {})
+        assert k1 != k2
+
+    def test_message_order_matters(self):
+        from llm_provider._cache import cache_key_messages
+
+        msgs1 = [
+            {"role": "user", "content": "a"},
+            {"role": "assistant", "content": "b"},
+        ]
+        msgs2 = [
+            {"role": "assistant", "content": "b"},
+            {"role": "user", "content": "a"},
+        ]
+        k1 = cache_key_messages("model", msgs1, {})
+        k2 = cache_key_messages("model", msgs2, {})
+        assert k1 != k2
+
+    def test_is_sha256(self):
+        from llm_provider._cache import cache_key_messages
+
+        k = cache_key_messages("m", [{"role": "user", "content": "p"}], {})
+        assert len(k) == 64
+
+
+# --- LLM.chat() ---
+
+
+class TestLLMChat:
+    def test_returns_string(self):
+        """chat() should return a string, not list of lists."""
+        llm = LLM("anthropic/claude-sonnet-4-6")
+
+        mock_choice = MagicMock()
+        mock_choice.message.content = "Hello!"
+        mock_response = MagicMock()
+        mock_response.choices = [mock_choice]
+        mock_response.usage.prompt_tokens = 10
+        mock_response.usage.completion_tokens = 5
+        mock_response.usage.prompt_tokens_details = None
+
+        with patch("llm_provider.providers.litellm_api._litellm") as mock_litellm:
+            mock_litellm.return_value.completion = MagicMock(return_value=mock_response)
+            mock_litellm.return_value.completion_cost.return_value = 0.001
+
+            result = llm.chat([{"role": "user", "content": "Hi"}], silent=True)
+
+        assert isinstance(result, str)
+        assert result == "Hello!"
+
+    def test_multi_turn(self):
+        """chat() with multi-turn conversation should work."""
+        llm = LLM("anthropic/claude-sonnet-4-6")
+
+        mock_choice = MagicMock()
+        mock_choice.message.content = "6"
+        mock_response = MagicMock()
+        mock_response.choices = [mock_choice]
+        mock_response.usage.prompt_tokens = 50
+        mock_response.usage.completion_tokens = 1
+        mock_response.usage.prompt_tokens_details = None
+
+        with patch("llm_provider.providers.litellm_api._litellm") as mock_litellm:
+            mock_litellm.return_value.completion = MagicMock(return_value=mock_response)
+            mock_litellm.return_value.completion_cost.return_value = 0.0
+
+            result = llm.chat(
+                [
+                    {"role": "system", "content": "Be concise."},
+                    {"role": "user", "content": "What is 2+2?"},
+                    {"role": "assistant", "content": "4"},
+                    {"role": "user", "content": "And 3+3?"},
+                ],
+                silent=True,
+            )
+
+        assert result == "6"
+
+    def test_passes_messages_directly(self):
+        """chat() should pass messages to the provider without modification."""
+        llm = LLM("anthropic/claude-sonnet-4-6")
+
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi!"},
+            {"role": "user", "content": "How are you?"},
+        ]
+
+        mock_choice = MagicMock()
+        mock_choice.message.content = "I'm good!"
+        mock_response = MagicMock()
+        mock_response.choices = [mock_choice]
+        mock_response.usage.prompt_tokens = 30
+        mock_response.usage.completion_tokens = 3
+        mock_response.usage.prompt_tokens_details = None
+
+        with patch("llm_provider.providers.litellm_api._litellm") as mock_litellm:
+            mock_litellm.return_value.completion = MagicMock(return_value=mock_response)
+            mock_litellm.return_value.completion_cost.return_value = 0.0
+
+            llm.chat(messages, silent=True)
+
+            call_kwargs = mock_litellm.return_value.completion.call_args
+            assert call_kwargs.kwargs["messages"] == messages
+
+    def test_cost_tracking(self):
+        """chat() should accumulate token counts and cost."""
+        llm = LLM("anthropic/claude-sonnet-4-6")
+
+        mock_choice = MagicMock()
+        mock_choice.message.content = "response"
+        mock_response = MagicMock()
+        mock_response.choices = [mock_choice]
+        mock_response.usage.prompt_tokens = 20
+        mock_response.usage.completion_tokens = 10
+        mock_response.usage.prompt_tokens_details = None
+
+        with patch("llm_provider.providers.litellm_api._litellm") as mock_litellm:
+            mock_litellm.return_value.completion = MagicMock(return_value=mock_response)
+            mock_litellm.return_value.completion_cost.return_value = 0.005
+
+            llm.chat([{"role": "user", "content": "test"}], silent=True)
+
+        assert llm.total_input_tokens == 20
+        assert llm.total_output_tokens == 10
+        assert llm.total_cost == 0.005
+
+    def test_openai_cache_hit(self):
+        """OpenAI chat() should return cached response without API call."""
+        import llm_provider.providers.openai_api as oai_mod
+
+        llm = LLM("gpt-4.1-nano")
+        llm._sync_client = MagicMock()  # Pre-set to avoid lazy creation
+
+        mock_cache = MagicMock()
+        mock_cache.get.return_value = "cached response"
+        original_cache = oai_mod.direct_cache
+        oai_mod.direct_cache = mock_cache
+        try:
+            result = llm.chat([{"role": "user", "content": "test"}], silent=True)
+        finally:
+            oai_mod.direct_cache = original_cache
+
+        assert result == "cached response"
+        # API should not have been called
+        llm._sync_client.chat.completions.create.assert_not_called()
+
+    def test_openai_cache_false(self):
+        """cache=False should bypass cache for chat()."""
+        import llm_provider.providers.openai_api as oai_mod
+
+        llm = LLM("gpt-4.1-nano")
+
+        mock_cache = MagicMock()
+        mock_cache.get.return_value = "cached"
+        original_cache = oai_mod.direct_cache
+        oai_mod.direct_cache = mock_cache
+
+        msg = MagicMock()
+        msg.content = "fresh"
+        msg.reasoning_content = None
+        choice = MagicMock()
+        choice.message = msg
+        resp = MagicMock()
+        resp.choices = [choice]
+        resp.usage.prompt_tokens = 10
+        resp.usage.completion_tokens = 5
+        resp.usage.prompt_tokens_details = None
+
+        sync_client = MagicMock()
+        sync_client.chat.completions.create.return_value = resp
+        llm._sync_client = sync_client
+
+        try:
+            result = llm.chat(
+                [{"role": "user", "content": "test"}],
+                cache=False,
+                silent=True,
+            )
+        finally:
+            oai_mod.direct_cache = original_cache
+
+        assert result == "fresh"
+        mock_cache.get.assert_not_called()
+
+    def test_openai_multi_turn(self):
+        """chat() passes multi-turn messages through to OpenAI."""
+        import llm_provider.providers.openai_api as oai_mod
+
+        llm = LLM("gpt-4.1-nano")
+
+        mock_cache = MagicMock()
+        mock_cache.get.return_value = None
+        original_cache = oai_mod.direct_cache
+        oai_mod.direct_cache = mock_cache
+
+        msg = MagicMock()
+        msg.content = "6"
+        msg.reasoning_content = None
+        choice = MagicMock()
+        choice.message = msg
+        resp = MagicMock()
+        resp.choices = [choice]
+        resp.usage.prompt_tokens = 50
+        resp.usage.completion_tokens = 1
+        resp.usage.prompt_tokens_details = None
+
+        sync_client = MagicMock()
+        sync_client.chat.completions.create.return_value = resp
+        llm._sync_client = sync_client
+
+        messages = [
+            {"role": "system", "content": "Be concise."},
+            {"role": "user", "content": "What is 2+2?"},
+            {"role": "assistant", "content": "4"},
+            {"role": "user", "content": "And 3+3?"},
+        ]
+
+        try:
+            result = llm.chat(messages, silent=True)
+        finally:
+            oai_mod.direct_cache = original_cache
+
+        assert result == "6"
+        # All 4 messages should be passed through
+        call_kwargs = sync_client.chat.completions.create.call_args
+        assert len(call_kwargs.kwargs["messages"]) == 4
+
+    def test_retry_on_429(self):
+        """chat() should retry on 429 errors with backoff."""
+        llm = LLM("anthropic/claude-sonnet-4-6")
+
+        rate_err = Exception("rate limit")
+        rate_err.status_code = 429
+
+        mock_choice = MagicMock()
+        mock_choice.message.content = "ok"
+        mock_response = MagicMock()
+        mock_response.choices = [mock_choice]
+        mock_response.usage.prompt_tokens = 10
+        mock_response.usage.completion_tokens = 5
+        mock_response.usage.prompt_tokens_details = None
+
+        with (
+            patch("llm_provider.providers.litellm_api._litellm") as mock_litellm,
+            patch("time.sleep"),
+        ):
+            mock_litellm.return_value.completion = MagicMock(
+                side_effect=[rate_err, mock_response]
+            )
+            mock_litellm.return_value.completion_cost.return_value = 0.0
+
+            result = llm.chat([{"role": "user", "content": "test"}], silent=True)
+
+        assert result == "ok"
+        assert mock_litellm.return_value.completion.call_count == 2
