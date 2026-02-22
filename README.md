@@ -19,7 +19,8 @@ At low concurrency the gap is small, but at batch scale (c=32+) HTTP/2 multiplex
 Other features:
 - **Lazy imports** -- 0.1s import vs 4s with litellm eager loading
 - **Disk caching** -- deterministic SHA-256 keyed; works across all providers including direct SDK paths (litellm only caches its own calls)
-- **Adaptive concurrency** -- AIMD: ramps up on success, backs off on 429 (litellm uses fixed concurrency)
+- **Adaptive concurrency** -- header-aware for OpenAI (preemptive backoff from `x-ratelimit-*`), AIMD fallback for others
+- **Batch API** -- 50% cost savings via OpenAI/Anthropic/Gemini batch endpoints
 - **Cumulative usage tracking** -- input/output/cached tokens + cost per instance (litellm tracks globally, not per-instance)
 - **Prefix cache tracking** for OpenAI/Anthropic
 
@@ -82,6 +83,36 @@ results = multi_chat(
 )
 # {"gpt-4.1-mini": "Hi!", "openrouter/anthropic/claude-sonnet-4": "Hello!"}
 ```
+
+### Batch API (50% cost savings)
+
+For offline workloads, the batch API submits to provider batch endpoints at half the cost of real-time requests. Same return format as `generate()`.
+
+```python
+llm = LLM("gpt-4.1-mini")
+
+# All-in-one: submit, poll, retrieve
+results = llm.batch(["What is 2+2?", "Name a color."], system_prompt="Be concise.")
+# [["4"], ["Blue"]]  -- same format as generate()
+
+# Split workflow for long-running jobs
+batch_id = llm.batch_submit(["What is 2+2?", "Name a color."])
+# "openai:2:batch_abc123"
+
+status = llm.batch_status(batch_id)
+# {"status": "in_progress", "counts": {"completed": 1, "failed": 0, "total": 2}}
+
+results = llm.batch_retrieve(batch_id)  # None if not done
+# [["4"], ["Blue"]]
+```
+
+`batch()` polls every 60s by default (configurable via `poll_interval`). Batch IDs are self-contained strings -- you can save them and retrieve results in a different session.
+
+Supported models:
+- `gpt-*`, `o3-*`, `o4-*` (OpenAI)
+- `anthropic/*` (Anthropic)
+- `gemini/*` (Gemini)
+- Others raise `NotImplementedError`
 
 ## Model naming
 
