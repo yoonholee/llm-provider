@@ -3,7 +3,7 @@
 ## 2026-02-17: llm_provider.py optimization
 
 ### Architecture: per-provider routing
-Provider detection: Gemini (`gemini/*`), OpenAI (`gpt-*`, `o1*`, `o3*`, `o4*`, `chatgpt-*`), Together (`together_ai/*`), everything else → litellm.
+Provider detection: Gemini (`gemini/*`), OpenAI (`gpt-*`, `o1*`, `o3*`, `o4*`, `chatgpt-*`), Together (`together_ai/*`), SambaNova (`sambanova/*`), OpenRouter (`openrouter/*`), Local (`local/*`), everything else → litellm.
 - OpenAI: `AsyncOpenAI(http_client=httpx.AsyncClient(http2=True))` -- HTTP/2 is the key
 - Together: `AsyncOpenAI(api_key=..., base_url="https://api.together.xyz/v1")` -- default httpx
 - Gemini: `genai.Client(api_key=...)` -- native SDK with streaming
@@ -28,6 +28,7 @@ Provider detection: Gemini (`gemini/*`), OpenAI (`gpt-*`, `o1*`, `o3*`, `o4*`, `
 | httpx keepalive_expiry, pool_timeout, big pool | No improvement on top of http2 |
 | TCP_NODELAY (socket_options) | Not supported by httpx.AsyncClient |
 | HTTP/2 for Together | Hurt throughput |
+| HTTP/2 for OpenRouter | 2.6x slower (0.95s vs 2.47s wall, c=16). Proxy layer negates multiplexing benefit. |
 | Direct Anthropic SDK | Slower than litellm at c=32 (1543 vs 1882 tok/s), noisy at c=64. HTTP/2 doesn't help. |
 | Scheduling order (longest-first) | Minimal effect with gather+semaphore |
 | litellm 1.81.x | Worse bugs than 1.80.9 (pass-through broken, event loop spam) |
@@ -166,8 +167,60 @@ Key: Direct wins at c=32 (1.3x), but at c=64 Together's rate limits kick in and 
 
 Key: litellm is consistently faster at c=8-32. At c=64, throughput is noisy (ratio 0.58-1.13x across runs). Direct+h2 has better TTFT p50 at c=64 but unreliable throughput advantage. HTTP/2 doesn't help Anthropic — may use per-connection rate limiting. Decision: keep on litellm.
 
+### OpenRouter (2026-02-22)
+
+- Provider: `openrouter/*` prefix, base URL `https://openrouter.ai/api/v1`
+- Defaults to `extra_body={"provider": {"sort": "price"}}` (cheapest provider first)
+- `allow_fallbacks` is true by default on OpenRouter side, auto-falls back if cheapest is slow/down
+- Override sorting: `extra_body={"provider": {"sort": "throughput"}}` for fastest
+- Other useful controls: `require_parameters`, `data_collection: "deny"`, `quantizations`
+- HTTP/2 hurts (same as Together). Proxy layer negates multiplexing. Left HTTP/2 off.
+- OpenRouter min `max_tokens` varies by backend provider (Azure rejects <16). Use >=32 to be safe.
+- Benchmark (c=16, 3 runs, openai/gpt-4.1-mini via OpenRouter):
+
+| Proto | wall | p50 | p95 |
+|---|---|---|---|
+| HTTP/1.1 | **0.95s** | **0.38s** | **0.80s** |
+| HTTP/2 | 2.47s | 0.77s | 2.47s |
+
+### Multi-model parallel API (2026-02-22)
+
+- `multi_generate(models, prompts, ...)` and `multi_chat(models, messages, ...)`: query N models in parallel
+- Uses `ThreadPoolExecutor(max_workers=len(models))`, one thread per model
+- Each model's `LLM.generate()` handles its own async batching internally
+- Returns `dict[str, ...]` keyed by model name
+- No shared concurrency control across models (each has its own AIMD semaphore)
+
+### Bug fixes (2026-02-22)
+
+- `_batch()` had `hasattr(self._client, "rotate")` without checking `hasattr(self, "_client")` first. Would AttributeError for litellm models. Fixed to match the guard in `chat()`.
+- Removed dead `_median()` function (never called by anything).
+
+### Code review findings (2026-02-22, not yet fixed)
+
+- `_AdaptiveSemaphore._adjust_window()` still mutates `asyncio.Semaphore._value` directly for shrink. Private API, technically unsafe under interleaving. Works in practice because asyncio is single-threaded, but fragile.
+- Gemini `n > 1` path: `input_tokens` multiplied from last result only, not summed across all n calls. Correct if all calls have identical prompt, but not self-consistent with how `output_tokens` is summed.
+- OpenAI-compatible providers (Together/SambaNova/OpenRouter) have identical `create_client`/`create_sync_client` boilerplate. Could extract a shared factory, but not worth it yet.
+
+### Adaptive concurrency v2 (2026-02-22)
+
+- Replaced `_AIMDSemaphore` with `_AdaptiveSemaphore`: header-aware + AIMD fallback
+- OpenAI `x-ratelimit-remaining-requests` / `x-ratelimit-limit-requests` headers parsed via httpx `event_hooks`
+- EMA smoothing (alpha=0.3) prevents oscillation when headers fluctuate
+- `_has_header_signal` flag: once headers arrive, AIMD on_success becomes no-op (prevents double-counting)
+- Semaphore now persistent on `LLM` instance -- rate limit state carries across `generate()` calls
+- httpx event_hooks don't need `with_raw_response()` -- they fire on every response transparently
+
+### Batch API (2026-02-22)
+
+- All three major providers supported: OpenAI (file-based JSONL), Anthropic (inline requests), Gemini (InlinedRequest)
+- Batch IDs are stateless strings: `"{provider}:{n_prompts}:{raw_id}"` -- no instance state needed between submit/retrieve
+- OpenAI: upload JSONL file -> `batches.create` -> poll `batches.retrieve` -> `files.content` to download output JSONL
+- Anthropic: inline `messages.batches.create(requests=[...])` -> poll `messages.batches.retrieve` -> iterate `messages.batches.results(id)`
+- Gemini: inline `batches.create(model=..., src=[InlinedRequest(...)])` -> poll `batches.get(name=...)` -> `batch_job.dest.inlined_responses`
+- All providers return results in arbitrary order -- must reorder by `custom_id` index
+- Anthropic needs direct SDK client (litellm doesn't expose batch API). Lazy-created `self._anthropic_client`.
+
 ### Future optimization ideas (not yet implemented)
-- **Key rotation**: Round-robin across API keys for Nx rate limit multiplier.
-- **Batch APIs**: OpenAI/Anthropic batch endpoints for offline work (50% cost reduction).
 - **Structured output / JSON mode**: Constrained decoding eliminates retry-on-parse-failure.
 - After HTTP/2 + direct SDK, the bottleneck is API servers. Further gains come from spending less, not going faster.

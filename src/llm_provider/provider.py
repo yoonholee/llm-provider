@@ -22,24 +22,30 @@ from llm_provider.providers import (
 
 log = logging.getLogger(__name__)
 
-# --- Adaptive concurrency (AIMD) ---
+# --- Adaptive concurrency ---
 
 _MIN_CONCURRENCY = 4
 _MAX_RETRIES = 5
 _BASE_DELAY = 2.0  # seconds
+_EMA_ALPHA = 0.3  # smoothing factor for header-based signals
 
 
-class _AIMDSemaphore:
-    """Semaphore with additive-increase / multiplicative-decrease.
+class _AdaptiveSemaphore:
+    """Semaphore with header-aware proportional control + AIMD fallback.
 
-    On success: window += 1 (up to max).
-    On 429: window //= 2 (down to _MIN_CONCURRENCY).
+    When rate-limit headers are available (OpenAI):
+      - on_headers(remaining, limit): target = (remaining/limit) * max, EMA smoothed
+    When no headers (Gemini, Together, etc.):
+      - on_success(): window += 1 (AIMD additive increase)
+    Always:
+      - on_rate_limit(): window //= 2 (hard 429 overrides everything)
     """
 
     def __init__(self, initial: int):
         self._max = initial
         self._window = initial
         self._sem = asyncio.Semaphore(initial)
+        self._has_header_signal = False
 
     async def acquire(self):
         await self._sem.acquire()
@@ -47,20 +53,50 @@ class _AIMDSemaphore:
     def release(self):
         self._sem.release()
 
+    def on_headers(self, remaining: int, limit: int):
+        """Header-based proportional control. Sets target from remaining/limit ratio."""
+        if limit <= 0:
+            return
+        self._has_header_signal = True
+        ratio = remaining / limit
+        raw_target = max(int(ratio * self._max), _MIN_CONCURRENCY)
+        # EMA smooth toward target
+        smoothed = self._window * (1 - _EMA_ALPHA) + raw_target * _EMA_ALPHA
+        target = max(int(smoothed), _MIN_CONCURRENCY)
+        self._adjust_window(target)
+
     def on_success(self):
+        """AIMD additive increase -- only when no header signals are flowing."""
+        if self._has_header_signal:
+            return
         if self._window < self._max:
             self._window = min(self._window + 1, self._max)
-            # Grow the semaphore by releasing one extra permit
             self._sem.release()
 
     def on_rate_limit(self):
+        """Hard 429 signal -- always halves, overrides headers."""
         new = max(self._window // 2, _MIN_CONCURRENCY)
-        if new < self._window:
-            shrink = self._window - new
+        self._adjust_window(new)
+
+    def _adjust_window(self, target: int):
+        """Shared grow/shrink logic. Centralizes _value mutation."""
+        target = max(target, _MIN_CONCURRENCY)
+        target = min(target, self._max)
+        if target == self._window:
+            return
+        if target > self._window:
+            # Grow: release extra permits
+            grow = target - self._window
+            for _ in range(grow):
+                self._sem.release()
+        else:
+            # Shrink: drain permits
+            shrink = self._window - target
             for _ in range(shrink):
                 if self._sem._value > 0:  # noqa: SLF001
                     self._sem._value -= 1  # noqa: SLF001
-            self._window = new
+            # If we couldn't drain enough (permits in flight), at least track the target
+        self._window = target
 
     @property
     def window(self):
@@ -225,11 +261,15 @@ class LLM:
         self.total_cached_tokens = 0
         self.total_cost = 0.0
         self._sync_client = None
+        self._sem = _AdaptiveSemaphore(max_concurrent)
 
         if _is_gemini(model):
             self._client = gemini.create_client()
         elif _is_openai(model):
-            self._client = openai_api.create_client(max_retries=max_retries)
+            self._client = openai_api.create_client(
+                max_retries=max_retries,
+                on_headers=self._sem.on_headers,
+            )
         elif _is_together(model):
             self._client = together.create_client(max_retries=max_retries)
         elif _is_local(model):
@@ -287,7 +327,7 @@ class LLM:
     async def _batch(
         self, prompts: list[str], system_prompt: str, **kwargs
     ) -> list[list[str]]:
-        sem = _AIMDSemaphore(self.max_concurrent)
+        sem = self._sem
         global_sem = _get_global_semaphore()
 
         async def run_one(prompt: str) -> list[str]:
@@ -470,7 +510,8 @@ class LLM:
             return self._sync_client
         if _is_openai(self.model):
             self._sync_client = openai_api.create_sync_client(
-                max_retries=self.max_retries
+                max_retries=self.max_retries,
+                on_headers=self._sem.on_headers,
             )
         elif _is_together(self.model):
             self._sync_client = together.create_sync_client(
@@ -537,6 +578,166 @@ class LLM:
             return litellm_api.call_messages_sync(
                 self.model, messages, self.max_retries, **kwargs
             )
+
+    # --- Batch API ---
+
+    @staticmethod
+    def _encode_batch_id(provider: str, n_prompts: int, raw_id: str) -> str:
+        return f"{provider}:{n_prompts}:{raw_id}"
+
+    @staticmethod
+    def _decode_batch_id(batch_id: str) -> tuple[str, int, str]:
+        parts = batch_id.split(":", 2)
+        return parts[0], int(parts[1]), parts[2]
+
+    def _get_batch_client(self):
+        """Return (provider_name, sync_client) for batch operations."""
+        from llm_provider.providers import _batch
+
+        if _is_openai(self.model):
+            return "openai", self._get_sync_client(), _batch
+        elif _is_gemini(self.model):
+            # Gemini: use the existing client pool's current client
+            return (
+                "gemini",
+                self._client.current
+                if hasattr(self._client, "current")
+                else self._client,
+                _batch,
+            )
+        elif self.model.startswith("anthropic/"):
+            return "anthropic", self._get_anthropic_client(), _batch
+        else:
+            raise NotImplementedError(
+                f"Batch API not supported for model '{self.model}'. "
+                "Supported: gpt-*, o3-*, o4-* (OpenAI), anthropic/* (Anthropic), gemini/* (Gemini)."
+            )
+
+    def _get_anthropic_client(self):
+        """Lazy-create direct Anthropic SDK client for batch API."""
+        if not hasattr(self, "_anthropic_client") or self._anthropic_client is None:
+            import anthropic
+
+            self._anthropic_client = anthropic.Anthropic()
+        return self._anthropic_client
+
+    def _get_batch_model_id(self) -> str:
+        """Get the raw model ID for batch API calls."""
+        if _is_openai(self.model):
+            return openai_api.model_id(self.model)
+        elif _is_gemini(self.model):
+            return gemini.model_id(self.model)
+        elif self.model.startswith("anthropic/"):
+            return self.model.removeprefix("anthropic/")
+        return self.model
+
+    def batch_submit(
+        self,
+        prompts: str | list[str],
+        system_prompt: str | None = None,
+        **kwargs: Any,
+    ) -> str:
+        """Submit a batch job. Returns an encoded batch ID.
+
+        Supported models: gpt-*, o3-*, o4-* (OpenAI), anthropic/* (Anthropic), gemini/* (Gemini).
+        """
+        prompt_list = [prompts] if isinstance(prompts, str) else prompts
+        provider, client, _batch = self._get_batch_client()
+        model_id = self._get_batch_model_id()
+
+        if provider == "openai":
+            raw_id = _batch.openai_submit(
+                client, model_id, prompt_list, system_prompt or "", **kwargs
+            )
+        elif provider == "anthropic":
+            raw_id = _batch.anthropic_submit(
+                client, model_id, prompt_list, system_prompt or "", **kwargs
+            )
+        elif provider == "gemini":
+            raw_id = _batch.gemini_submit(
+                client, model_id, prompt_list, system_prompt or "", **kwargs
+            )
+        else:
+            raise NotImplementedError(f"Batch not supported for provider: {provider}")
+
+        return self._encode_batch_id(provider, len(prompt_list), raw_id)
+
+    def batch_status(self, batch_id: str) -> dict:
+        """Check batch job status. Returns {"status": str, "counts": dict}."""
+        provider, n_prompts, raw_id = self._decode_batch_id(batch_id)
+        from llm_provider.providers import _batch
+
+        if provider == "openai":
+            client = self._get_sync_client()
+            return _batch.openai_status(client, raw_id)
+        elif provider == "anthropic":
+            client = self._get_anthropic_client()
+            return _batch.anthropic_status(client, raw_id)
+        elif provider == "gemini":
+            client = (
+                self._client.current
+                if hasattr(self._client, "current")
+                else self._client
+            )
+            return _batch.gemini_status(client, raw_id)
+        else:
+            raise NotImplementedError(f"Batch not supported for provider: {provider}")
+
+    def batch_retrieve(self, batch_id: str) -> list[list[str]] | None:
+        """Retrieve batch results. Returns None if not done, list[list[str]] if done."""
+        provider, n_prompts, raw_id = self._decode_batch_id(batch_id)
+        from llm_provider.providers import _batch
+
+        if provider == "openai":
+            client = self._get_sync_client()
+            return _batch.openai_retrieve(client, raw_id, n_prompts)
+        elif provider == "anthropic":
+            client = self._get_anthropic_client()
+            return _batch.anthropic_retrieve(client, raw_id, n_prompts)
+        elif provider == "gemini":
+            client = (
+                self._client.current
+                if hasattr(self._client, "current")
+                else self._client
+            )
+            return _batch.gemini_retrieve(client, raw_id, n_prompts)
+        else:
+            raise NotImplementedError(f"Batch not supported for provider: {provider}")
+
+    def batch(
+        self,
+        prompts: str | list[str],
+        system_prompt: str | None = None,
+        poll_interval: float = 60,
+        timeout: float = 86400,
+        **kwargs: Any,
+    ) -> list[list[str]]:
+        """Submit batch, poll until done, retrieve results.
+
+        50% cost savings vs generate() for supported providers.
+        Returns list[list[str]], same format as generate().
+
+        Args:
+            prompts: Single prompt or list of prompts.
+            system_prompt: Optional system prompt.
+            poll_interval: Seconds between status checks (default 60).
+            timeout: Max wait in seconds (default 24h).
+        """
+        from llm_provider.providers import _batch as _batch_mod
+
+        batch_id = self.batch_submit(prompts, system_prompt, **kwargs)
+        provider, n_prompts, raw_id = self._decode_batch_id(batch_id)
+
+        def _status_fn():
+            return self.batch_status(batch_id)
+
+        _batch_mod.poll_until_done(
+            _status_fn, poll_interval=poll_interval, timeout=timeout
+        )
+        results = self.batch_retrieve(batch_id)
+        if results is None:
+            raise RuntimeError(f"Batch {batch_id} completed but results unavailable")
+        return results
 
 
 # --- Multi-model parallel ---

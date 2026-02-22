@@ -9,7 +9,9 @@ import pytest
 from llm_provider._cache import cache_key
 from llm_provider.provider import (
     LLM,
+    _AdaptiveSemaphore,
     _FileSlotSemaphore,
+    _MIN_CONCURRENCY,
     _is_gemini,
     _is_local,
     _is_openai,
@@ -20,6 +22,119 @@ from llm_provider.provider import (
     multi_generate,
 )
 from llm_provider.providers import gemini, local, openai_api, openrouter, together
+from llm_provider.providers._headers import parse_openai_headers
+
+
+# --- Header parsing ---
+
+
+class TestHeaderParsing:
+    def test_openai_headers_present(self):
+        headers = {
+            "x-ratelimit-remaining-requests": "450",
+            "x-ratelimit-limit-requests": "500",
+        }
+        result = parse_openai_headers(headers)
+        assert result == {"remaining": 450, "limit": 500}
+
+    def test_openai_headers_missing(self):
+        assert parse_openai_headers({}) is None
+
+    def test_openai_headers_partial(self):
+        headers = {"x-ratelimit-remaining-requests": "450"}
+        assert parse_openai_headers(headers) is None
+
+    def test_openai_headers_zero_limit(self):
+        headers = {
+            "x-ratelimit-remaining-requests": "0",
+            "x-ratelimit-limit-requests": "0",
+        }
+        assert parse_openai_headers(headers) is None
+
+    def test_openai_headers_non_numeric(self):
+        headers = {
+            "x-ratelimit-remaining-requests": "abc",
+            "x-ratelimit-limit-requests": "500",
+        }
+        assert parse_openai_headers(headers) is None
+
+
+# --- Adaptive semaphore ---
+
+
+class TestAdaptiveSemaphore:
+    def test_aimd_additive_increase(self):
+        """Without headers, on_success should +1 (AIMD)."""
+        sem = _AdaptiveSemaphore(10)
+        # Start at max, on_success should be no-op
+        assert sem.window == 10
+        sem.on_success()
+        assert sem.window == 10
+
+    def test_aimd_increase_from_below_max(self):
+        """AIMD should grow window by 1 when below max."""
+        sem = _AdaptiveSemaphore(10)
+        # Force window down
+        sem.on_rate_limit()  # 10 -> 5
+        assert sem.window == 5
+        sem.on_success()
+        assert sem.window == 6
+
+    def test_rate_limit_halves(self):
+        """on_rate_limit should halve the window."""
+        sem = _AdaptiveSemaphore(32)
+        sem.on_rate_limit()
+        assert sem.window == 16
+        sem.on_rate_limit()
+        assert sem.window == 8
+        sem.on_rate_limit()
+        assert sem.window == _MIN_CONCURRENCY
+
+    def test_rate_limit_floor(self):
+        """Window should never go below _MIN_CONCURRENCY."""
+        sem = _AdaptiveSemaphore(8)
+        for _ in range(10):
+            sem.on_rate_limit()
+        assert sem.window == _MIN_CONCURRENCY
+
+    def test_header_proportional_control(self):
+        """on_headers should set window proportionally to remaining/limit."""
+        sem = _AdaptiveSemaphore(32)
+        # Signal: 50% remaining -> target = 16, EMA: 0.7*32 + 0.3*16 = 27.2 -> 27
+        sem.on_headers(250, 500)
+        assert sem.window < 32  # Should decrease from initial
+        # Signal many times with same ratio to converge
+        for _ in range(20):
+            sem.on_headers(250, 500)
+        # Should converge to ~16
+        assert abs(sem.window - 16) <= 1
+
+    def test_header_suppresses_aimd(self):
+        """Once headers arrive, on_success should be a no-op."""
+        sem = _AdaptiveSemaphore(10)
+        sem.on_rate_limit()  # Drop to 5
+        assert sem.window == 5
+        sem.on_headers(450, 500)  # Header signal
+        w_after_header = sem.window
+        sem.on_success()
+        assert sem.window == w_after_header  # No AIMD change
+
+    def test_429_overrides_headers(self):
+        """on_rate_limit should halve regardless of header state."""
+        sem = _AdaptiveSemaphore(32)
+        # Feed headers to fill window
+        for _ in range(20):
+            sem.on_headers(480, 500)
+        w = sem.window
+        sem.on_rate_limit()
+        assert sem.window == max(w // 2, _MIN_CONCURRENCY)
+
+    def test_ema_smoothing(self):
+        """EMA should smooth jumps rather than snapping to target."""
+        sem = _AdaptiveSemaphore(32)
+        # One signal with low ratio should not snap all the way down
+        sem.on_headers(50, 500)  # 10% -> target=4 (MIN), EMA: 0.7*32 + 0.3*4 = 23.6
+        assert sem.window > _MIN_CONCURRENCY  # EMA prevents snap
 
 
 # --- Rate limit detection ---

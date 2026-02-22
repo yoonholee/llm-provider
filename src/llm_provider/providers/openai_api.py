@@ -23,10 +23,21 @@ def strip_thinking(text: str) -> str:
     return text.strip()
 
 
-def create_client(max_retries: int = 2):
+def create_client(max_retries: int = 2, on_headers=None):
     from openai import AsyncOpenAI
 
     from llm_provider.providers._pool import ClientPool
+
+    event_hooks = {}
+    if on_headers:
+        from llm_provider.providers._headers import parse_openai_headers
+
+        async def _hook(response: httpx.Response):
+            info = parse_openai_headers(response.headers)
+            if info:
+                on_headers(info["remaining"], info["limit"])
+
+        event_hooks["response"] = [_hook]
 
     # OPENAI_KEYS: comma-separated list for rotation; OPENAI_API_KEY: single key
     keys_str = os.environ.get("OPENAI_KEYS")
@@ -35,22 +46,33 @@ def create_client(max_retries: int = 2):
         clients = [
             AsyncOpenAI(
                 api_key=k,
-                http_client=httpx.AsyncClient(http2=True),
+                http_client=httpx.AsyncClient(http2=True, event_hooks=event_hooks),
                 max_retries=max_retries,
             )
             for k in keys
         ]
         return ClientPool(clients)
     return AsyncOpenAI(
-        http_client=httpx.AsyncClient(http2=True),
+        http_client=httpx.AsyncClient(http2=True, event_hooks=event_hooks),
         max_retries=max_retries,
     )
 
 
-def create_sync_client(max_retries: int = 2):
+def create_sync_client(max_retries: int = 2, on_headers=None):
     from openai import OpenAI
 
     from llm_provider.providers._pool import ClientPool
+
+    event_hooks = {}
+    if on_headers:
+        from llm_provider.providers._headers import parse_openai_headers
+
+        def _hook(response: httpx.Response):
+            info = parse_openai_headers(response.headers)
+            if info:
+                on_headers(info["remaining"], info["limit"])
+
+        event_hooks["response"] = [_hook]
 
     keys_str = os.environ.get("OPENAI_KEYS")
     if keys_str:
@@ -58,14 +80,14 @@ def create_sync_client(max_retries: int = 2):
         clients = [
             OpenAI(
                 api_key=k,
-                http_client=httpx.Client(http2=True),
+                http_client=httpx.Client(http2=True, event_hooks=event_hooks),
                 max_retries=max_retries,
             )
             for k in keys
         ]
         return ClientPool(clients)
     return OpenAI(
-        http_client=httpx.Client(http2=True),
+        http_client=httpx.Client(http2=True, event_hooks=event_hooks),
         max_retries=max_retries,
     )
 
