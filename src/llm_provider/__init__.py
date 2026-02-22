@@ -7,6 +7,6 @@ Usage:
 """
 
 from llm_provider.pricing import PRICES, cost
-from llm_provider.provider import LLM
+from llm_provider.provider import LLM, multi_chat, multi_generate
 
-__all__ = ["LLM", "PRICES", "cost"]
+__all__ = ["LLM", "PRICES", "cost", "multi_generate", "multi_chat"]

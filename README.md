@@ -50,19 +50,61 @@ results = llm.generate([f"Question {i}" for i in range(100)])
 print(llm.total_input_tokens, llm.total_output_tokens, llm.total_cost)
 ```
 
+### Multi-turn chat
+
+```python
+result = llm.chat([
+    {"role": "system", "content": "Be concise."},
+    {"role": "user", "content": "What is 2+2?"},
+    {"role": "assistant", "content": "4"},
+    {"role": "user", "content": "And 3+3?"},
+])  # -> "6"
+```
+
+### Multi-model parallel
+
+Query multiple models on the same prompt(s), in parallel:
+
+```python
+from llm_provider import multi_generate, multi_chat
+
+# Batch generation across models
+results = multi_generate(
+    ["gpt-4.1-mini", "gemini/gemini-3-flash-preview", "anthropic/claude-sonnet-4-6"],
+    ["What is 2+2?", "Name a color."],
+)
+# {"gpt-4.1-mini": [["4"], ["Blue"]], ...}
+
+# Chat across models
+results = multi_chat(
+    ["gpt-4.1-mini", "openrouter/anthropic/claude-sonnet-4"],
+    [{"role": "user", "content": "Hello"}],
+)
+# {"gpt-4.1-mini": "Hi!", "openrouter/anthropic/claude-sonnet-4": "Hello!"}
+```
+
 ## Model naming
 
 Uses litellm conventions:
-- `gpt-4.1-nano`, `gpt-4.1-mini`, `o3-mini` -- OpenAI (direct SDK)
+- `gpt-4.1-nano`, `gpt-4.1-mini`, `o3-mini` -- OpenAI (direct SDK + HTTP/2)
 - `gemini/gemini-3-flash-preview` -- Gemini (native SDK)
 - `together_ai/meta-llama/...` -- Together (direct SDK)
+- `sambanova/Meta-Llama-3.3-70B-Instruct` -- SambaNova (direct SDK)
+- `openrouter/anthropic/claude-sonnet-4` -- OpenRouter (sorts by price)
+- `local/model-name` -- Local OpenAI-compatible server (vLLM, SGLang, Ollama)
 - `anthropic/claude-sonnet-4-6` -- Anthropic (litellm fallback)
 - Everything else -- litellm fallback
 
 ## Environment variables
 
-- `OPENAI_API_KEY` -- for OpenAI models
-- `GEMINI_API_KEY` -- for Gemini models
-- `TOGETHER_API_KEY` -- for Together models
+API keys (single key or comma-separated for rotation):
+- `OPENAI_API_KEY` / `OPENAI_KEYS`
+- `GEMINI_API_KEY` / `GEMINI_KEYS`
+- `TOGETHER_API_KEY` / `TOGETHER_KEYS`
+- `SAMBANOVA_API_KEY` / `SAMBANOVA_KEYS`
+- `OPENROUTER_API_KEY` / `OPENROUTER_KEYS`
+
+Config:
 - `LLM_CACHE_DIR` -- override cache location (default: `/scr/yoonho/llm-cache`, fallback to `/tmp/llm_cache`)
 - `LLM_GLOBAL_CONCURRENCY` -- cross-process concurrency limit via file locks (e.g., `64` for 16 processes sharing a rate limit)
+- `LOCAL_BASE_URL` -- override local server URL (default: `http://localhost:30000/v1`)

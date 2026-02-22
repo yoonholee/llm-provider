@@ -15,6 +15,7 @@ from llm_provider.providers import (
     litellm_api,
     local,
     openai_api,
+    openrouter,
     sambanova,
     together,
 )
@@ -162,6 +163,10 @@ def _is_sambanova(model: str) -> bool:
     return model.startswith("sambanova/")
 
 
+def _is_openrouter(model: str) -> bool:
+    return model.startswith("openrouter/")
+
+
 def _is_rate_limit(exc: Exception) -> bool:
     """Check if an exception is a 429 rate limit error."""
     # OpenAI SDK
@@ -205,6 +210,7 @@ class LLM:
       - Together (together_ai/*): direct SDK via OpenAI-compatible API
       - Local (local/*): OpenAI-compatible API on localhost (vLLM, SGLang, etc.)
       - SambaNova (sambanova/*): OpenAI-compatible API
+      - OpenRouter (openrouter/*): OpenAI-compatible API, sorts by price
       - All others: litellm fallback
 
     Token counts are cumulative across generate() and chat() calls.
@@ -230,6 +236,8 @@ class LLM:
             self._client = local.create_client(max_retries=max_retries)
         elif _is_sambanova(model):
             self._client = sambanova.create_client(max_retries=max_retries)
+        elif _is_openrouter(model):
+            self._client = openrouter.create_client(max_retries=max_retries)
 
     def generate(
         self,
@@ -295,7 +303,7 @@ class LLM:
                     if _is_rate_limit(e):
                         sem.on_rate_limit()
                         # Rotate API key on 429 (if client pool has multiple keys)
-                        if hasattr(self._client, "rotate"):
+                        if hasattr(self, "_client") and hasattr(self._client, "rotate"):
                             if self._client.rotate():
                                 log.info("429 [%s] rotated to next API key", self.model)
                         if attempt < _MAX_RETRIES:
@@ -361,6 +369,14 @@ class LLM:
                 prompt,
                 system_prompt,
                 **kwargs,
+            )
+        elif _is_openrouter(self.model):
+            texts, usage = await openai_api.call(
+                self._client,
+                openrouter.model_id(self.model),
+                prompt,
+                system_prompt,
+                **openrouter.inject_provider_kwargs(kwargs),
             )
         else:
             texts, usage = await litellm_api.call(
@@ -466,6 +482,10 @@ class LLM:
             self._sync_client = sambanova.create_sync_client(
                 max_retries=self.max_retries
             )
+        elif _is_openrouter(self.model):
+            self._sync_client = openrouter.create_sync_client(
+                max_retries=self.max_retries
+            )
         # Gemini: reuse self._client (has sync methods via .models)
         # litellm: no client needed (module-level functions)
         return self._sync_client
@@ -506,19 +526,112 @@ class LLM:
                 messages,
                 **kwargs,
             )
+        elif _is_openrouter(self.model):
+            return openai_api.call_messages_sync(
+                self._get_sync_client(),
+                openrouter.model_id(self.model),
+                messages,
+                **openrouter.inject_provider_kwargs(kwargs),
+            )
         else:
             return litellm_api.call_messages_sync(
                 self.model, messages, self.max_retries, **kwargs
             )
 
 
+# --- Multi-model parallel ---
+
+
+def multi_generate(
+    models: list[str],
+    prompts: str | list[str],
+    system_prompt: str | None = None,
+    **kwargs: Any,
+) -> dict[str, list[list[str]]]:
+    """Query multiple models in parallel on the same prompts.
+
+    Returns {model: generate_result} dict.
+    Each LLM.generate() handles its own internal batching/concurrency.
+
+    Args:
+        models: List of model identifiers.
+        prompts: Single prompt or list of prompts (shared across all models).
+        system_prompt: Optional system prompt (shared across all models).
+        **kwargs: Passed to each LLM.generate().
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    silent = kwargs.pop("silent", False)
+
+    def _run(model: str):
+        llm = LLM(model)
+        result = llm.generate(
+            prompts, system_prompt=system_prompt, silent=True, **kwargs
+        )
+        return model, result, llm
+
+    results = {}
+    total_cost = 0.0
+    t0 = time.monotonic()
+
+    with ThreadPoolExecutor(max_workers=len(models)) as pool:
+        futures = {pool.submit(_run, m): m for m in models}
+        for future in as_completed(futures):
+            model, result, llm = future.result()
+            results[model] = result
+            total_cost += llm.total_cost
+
+    if not silent:
+        elapsed = time.monotonic() - t0
+        cost_str = f" ${total_cost:.4f}" if total_cost > 0 else ""
+        print(f"  {len(models)} models |{cost_str} {elapsed:.1f}s")
+
+    return results
+
+
+def multi_chat(
+    models: list[str],
+    messages: list[dict[str, str]],
+    **kwargs: Any,
+) -> dict[str, str]:
+    """Query multiple models in parallel with the same messages.
+
+    Returns {model: response_string} dict.
+
+    Args:
+        models: List of model identifiers.
+        messages: Message history (shared across all models).
+        **kwargs: Passed to each LLM.chat().
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    silent = kwargs.pop("silent", False)
+
+    def _run(model: str):
+        llm = LLM(model)
+        result = llm.chat(messages, silent=True, **kwargs)
+        return model, result, llm
+
+    results = {}
+    total_cost = 0.0
+    t0 = time.monotonic()
+
+    with ThreadPoolExecutor(max_workers=len(models)) as pool:
+        futures = {pool.submit(_run, m): m for m in models}
+        for future in as_completed(futures):
+            model, result, llm = future.result()
+            results[model] = result
+            total_cost += llm.total_cost
+
+    if not silent:
+        elapsed = time.monotonic() - t0
+        cost_str = f" ${total_cost:.4f}" if total_cost > 0 else ""
+        print(f"  {len(models)} models |{cost_str} {elapsed:.1f}s")
+
+    return results
+
+
 # --- Benchmark helpers ---
-
-
-def _median(xs: list[float]) -> float:
-    s = sorted(xs)
-    n = len(s)
-    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
 
 
 async def _bench_one_stream(model: str, messages: list, *, clients=None, **kwargs):
@@ -541,5 +654,12 @@ async def _bench_one_stream(model: str, messages: list, *, clients=None, **kwarg
     if _is_sambanova(model) and "sambanova" in clients:
         return await openai_api.bench_stream(
             clients["sambanova"], sambanova.model_id(model), messages, **kwargs
+        )
+    if _is_openrouter(model) and "openrouter" in clients:
+        return await openai_api.bench_stream(
+            clients["openrouter"],
+            openrouter.model_id(model),
+            messages,
+            **openrouter.inject_provider_kwargs(kwargs),
         )
     return await litellm_api.bench_stream(model, messages, **kwargs)

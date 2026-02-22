@@ -13,11 +13,13 @@ from llm_provider.provider import (
     _is_gemini,
     _is_local,
     _is_openai,
+    _is_openrouter,
     _is_together,
     _is_rate_limit,
-    _median,
+    multi_chat,
+    multi_generate,
 )
-from llm_provider.providers import gemini, local, openai_api, together
+from llm_provider.providers import gemini, local, openai_api, openrouter, together
 
 
 # --- Rate limit detection ---
@@ -91,6 +93,12 @@ class TestProviderDetection:
         assert not _is_local("gpt-4.1-nano")
         assert not _is_local("together_ai/meta-llama/Llama-3-8b")
 
+    def test_openrouter(self):
+        assert _is_openrouter("openrouter/anthropic/claude-sonnet-4")
+        assert _is_openrouter("openrouter/openai/gpt-4.1-nano")
+        assert not _is_openrouter("gpt-4.1-nano")
+        assert not _is_openrouter("together_ai/meta-llama/Llama-3-8b")
+
 
 # --- Model ID extraction ---
 
@@ -114,6 +122,16 @@ class TestModelId:
     def test_local_model_id(self):
         assert local.model_id("local/Qwen/Qwen3-4B") == "Qwen/Qwen3-4B"
         assert local.model_id("local/meta-llama/Llama-3-8b") == "meta-llama/Llama-3-8b"
+
+    def test_openrouter_model_id(self):
+        assert (
+            openrouter.model_id("openrouter/anthropic/claude-sonnet-4")
+            == "anthropic/claude-sonnet-4"
+        )
+        assert (
+            openrouter.model_id("openrouter/openai/gpt-4.1-nano")
+            == "openai/gpt-4.1-nano"
+        )
 
 
 # --- Cache key ---
@@ -246,20 +264,6 @@ class TestCallThinkingIntegration:
 
         texts, usage = self._call_with_mock_cache(client, "gpt-4.1-nano", "test")
         assert texts == ["Hello world"]
-
-
-# --- Median ---
-
-
-class TestMedian:
-    def test_odd(self):
-        assert _median([3, 1, 2]) == 2
-
-    def test_even(self):
-        assert _median([4, 1, 3, 2]) == 2.5
-
-    def test_single(self):
-        assert _median([42]) == 42
 
 
 # --- LLM class (mocked) ---
@@ -624,6 +628,58 @@ class TestSambaNovaProvider:
             assert hasattr(llm, "_client")
 
 
+# --- OpenRouter provider ---
+
+
+class TestOpenRouterProvider:
+    def test_detection(self):
+        assert _is_openrouter("openrouter/anthropic/claude-sonnet-4")
+        assert _is_openrouter("openrouter/openai/gpt-4.1-nano")
+        assert not _is_openrouter("together_ai/meta-llama/Llama-3-8b")
+        assert not _is_openrouter("gpt-4.1-nano")
+
+    def test_model_id(self):
+        assert (
+            openrouter.model_id("openrouter/anthropic/claude-sonnet-4")
+            == "anthropic/claude-sonnet-4"
+        )
+
+    def test_requires_api_key(self):
+        with patch.dict("os.environ", {}, clear=True):
+            with pytest.raises(ValueError, match="OPENROUTER_API_KEY"):
+                LLM("openrouter/anthropic/claude-sonnet-4")
+
+    def test_creates_client(self):
+        with patch.dict("os.environ", {"OPENROUTER_API_KEY": "test-key"}):
+            llm = LLM("openrouter/anthropic/claude-sonnet-4")
+            assert hasattr(llm, "_client")
+
+    def test_inject_default_provider(self):
+        """inject_provider_kwargs should add sort=price by default."""
+        result = openrouter.inject_provider_kwargs({})
+        assert result["extra_body"]["provider"]["sort"] == "price"
+
+    def test_inject_preserves_existing_provider(self):
+        """User-supplied provider config should not be overwritten."""
+        kwargs = {"extra_body": {"provider": {"sort": "throughput"}}}
+        result = openrouter.inject_provider_kwargs(kwargs)
+        assert result["extra_body"]["provider"]["sort"] == "throughput"
+
+    def test_inject_preserves_other_extra_body(self):
+        """Other extra_body keys should be preserved."""
+        kwargs = {"extra_body": {"transforms": ["middle-out"]}}
+        result = openrouter.inject_provider_kwargs(kwargs)
+        assert result["extra_body"]["transforms"] == ["middle-out"]
+        assert result["extra_body"]["provider"]["sort"] == "price"
+
+    def test_inject_does_not_mutate_input(self):
+        """inject_provider_kwargs should not mutate the original dict."""
+        original = {"temperature": 0.7}
+        result = openrouter.inject_provider_kwargs(original)
+        assert "extra_body" not in original
+        assert "extra_body" in result
+
+
 # --- Chat cache key ---
 
 
@@ -907,3 +963,67 @@ class TestLLMChat:
 
         assert result == "ok"
         assert mock_litellm.return_value.completion.call_count == 2
+
+
+# --- Multi-model parallel ---
+
+
+class TestMultiGenerate:
+    def test_returns_dict_keyed_by_model(self):
+        """multi_generate should return results keyed by model name."""
+        mock_choice = MagicMock()
+        mock_choice.message.content = "Hello!"
+        mock_response = MagicMock()
+        mock_response.choices = [mock_choice]
+        mock_response.usage.prompt_tokens = 10
+        mock_response.usage.completion_tokens = 5
+        mock_response.usage.prompt_tokens_details = None
+
+        with patch("llm_provider.providers.litellm_api._litellm") as mock_litellm:
+            mock_litellm.return_value.acompletion = AsyncMock(
+                return_value=mock_response
+            )
+            mock_litellm.return_value.completion_cost.return_value = 0.0
+
+            results = multi_generate(
+                ["anthropic/claude-sonnet-4-6", "anthropic/claude-haiku-4-5"],
+                "Hi",
+                silent=True,
+            )
+
+        assert set(results.keys()) == {
+            "anthropic/claude-sonnet-4-6",
+            "anthropic/claude-haiku-4-5",
+        }
+        assert results["anthropic/claude-sonnet-4-6"] == [["Hello!"]]
+        assert results["anthropic/claude-haiku-4-5"] == [["Hello!"]]
+
+
+class TestMultiChat:
+    def test_returns_dict_of_strings(self):
+        """multi_chat should return {model: response_string}."""
+        mock_choice = MagicMock()
+        mock_choice.message.content = "response"
+        mock_response = MagicMock()
+        mock_response.choices = [mock_choice]
+        mock_response.usage.prompt_tokens = 10
+        mock_response.usage.completion_tokens = 5
+        mock_response.usage.prompt_tokens_details = None
+
+        with patch("llm_provider.providers.litellm_api._litellm") as mock_litellm:
+            mock_litellm.return_value.completion = MagicMock(return_value=mock_response)
+            mock_litellm.return_value.completion_cost.return_value = 0.0
+
+            results = multi_chat(
+                ["anthropic/claude-sonnet-4-6", "anthropic/claude-haiku-4-5"],
+                [{"role": "user", "content": "Hello"}],
+                silent=True,
+            )
+
+        assert set(results.keys()) == {
+            "anthropic/claude-sonnet-4-6",
+            "anthropic/claude-haiku-4-5",
+        }
+        for v in results.values():
+            assert isinstance(v, str)
+            assert v == "response"
