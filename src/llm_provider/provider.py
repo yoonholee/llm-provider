@@ -27,14 +27,18 @@ log = logging.getLogger(__name__)
 _MIN_CONCURRENCY = 4
 _MAX_RETRIES = 5
 _BASE_DELAY = 2.0  # seconds
-_EMA_ALPHA = 0.3  # smoothing factor for header-based signals
+# Back off when remaining requests drops below this fraction of the limit.
+# At 10%, with 30k RPM limit, that's 3000 left -- enough for ~50 RPS.
+# Below this threshold, scale window proportionally to remaining/threshold.
+_HEADER_BACKOFF_THRESHOLD = 0.10
 
 
 class _AdaptiveSemaphore:
-    """Semaphore with header-aware proportional control + AIMD fallback.
+    """Semaphore with header-aware early warning + AIMD fallback.
 
     When rate-limit headers are available (OpenAI):
-      - on_headers(remaining, limit): target = (remaining/limit) * max, EMA smoothed
+      - on_headers(remaining, limit): preemptive backoff when remaining < 10% of limit.
+        Above threshold -> AIMD grow as normal. Below -> scale proportionally.
     When no headers (Gemini, Together, etc.):
       - on_success(): window += 1 (AIMD additive increase)
     Always:
@@ -54,16 +58,22 @@ class _AdaptiveSemaphore:
         self._sem.release()
 
     def on_headers(self, remaining: int, limit: int):
-        """Header-based proportional control. Sets target from remaining/limit ratio."""
+        """Header-based early warning. Only backs off when remaining is scarce."""
         if limit <= 0:
             return
         self._has_header_signal = True
         ratio = remaining / limit
-        raw_target = max(int(ratio * self._max), _MIN_CONCURRENCY)
-        # EMA smooth toward target
-        smoothed = self._window * (1 - _EMA_ALPHA) + raw_target * _EMA_ALPHA
-        target = max(int(smoothed), _MIN_CONCURRENCY)
-        self._adjust_window(target)
+        if ratio >= _HEADER_BACKOFF_THRESHOLD:
+            # Plenty of headroom -- let AIMD grow normally
+            if self._window < self._max:
+                self._window = min(self._window + 1, self._max)
+                self._sem.release()
+        else:
+            # Scarce: scale proportionally within the danger zone
+            # ratio=0.10 -> full max, ratio=0 -> MIN_CONCURRENCY
+            scale = ratio / _HEADER_BACKOFF_THRESHOLD
+            target = int(_MIN_CONCURRENCY + scale * (self._max - _MIN_CONCURRENCY))
+            self._adjust_window(target)
 
     def on_success(self):
         """AIMD additive increase -- only when no header signals are flowing."""

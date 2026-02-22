@@ -97,44 +97,68 @@ class TestAdaptiveSemaphore:
             sem.on_rate_limit()
         assert sem.window == _MIN_CONCURRENCY
 
-    def test_header_proportional_control(self):
-        """on_headers should set window proportionally to remaining/limit."""
+    def test_header_above_threshold_grows(self):
+        """With plenty of headroom (>10%), headers should grow like AIMD."""
         sem = _AdaptiveSemaphore(32)
-        # Signal: 50% remaining -> target = 16, EMA: 0.7*32 + 0.3*16 = 27.2 -> 27
+        sem.on_rate_limit()  # Drop to 16
+        assert sem.window == 16
+        # 50% remaining -> above threshold -> should grow +1
         sem.on_headers(250, 500)
-        assert sem.window < 32  # Should decrease from initial
-        # Signal many times with same ratio to converge
-        for _ in range(20):
-            sem.on_headers(250, 500)
-        # Should converge to ~16
-        assert abs(sem.window - 16) <= 1
+        assert sem.window == 17
 
-    def test_header_suppresses_aimd(self):
+    def test_header_above_threshold_grows_to_max(self):
+        """Repeated above-threshold headers should grow to max."""
+        sem = _AdaptiveSemaphore(10)
+        sem.on_rate_limit()  # Drop to 5
+        for _ in range(10):
+            sem.on_headers(400, 500)  # 80% remaining
+        assert sem.window == 10
+
+    def test_header_below_threshold_backs_off(self):
+        """When remaining < 10% of limit, window should drop proportionally."""
+        sem = _AdaptiveSemaphore(32)
+        # 5% remaining -> scale = 0.5 -> target = 4 + 0.5*28 = 18
+        sem.on_headers(25, 500)
+        assert sem.window == 18
+
+    def test_header_near_zero_hits_floor(self):
+        """Near-zero remaining should drop to MIN_CONCURRENCY."""
+        sem = _AdaptiveSemaphore(32)
+        sem.on_headers(1, 500)  # 0.2% remaining
+        assert sem.window == _MIN_CONCURRENCY
+
+    def test_header_suppresses_plain_aimd(self):
         """Once headers arrive, on_success should be a no-op."""
         sem = _AdaptiveSemaphore(10)
         sem.on_rate_limit()  # Drop to 5
         assert sem.window == 5
-        sem.on_headers(450, 500)  # Header signal
+        sem.on_headers(450, 500)  # Header signal (above threshold, grows +1)
         w_after_header = sem.window
+        assert w_after_header == 6
         sem.on_success()
-        assert sem.window == w_after_header  # No AIMD change
+        assert sem.window == w_after_header  # No additional AIMD change
 
     def test_429_overrides_headers(self):
         """on_rate_limit should halve regardless of header state."""
         sem = _AdaptiveSemaphore(32)
-        # Feed headers to fill window
-        for _ in range(20):
+        # Feed above-threshold headers to grow to max
+        for _ in range(5):
             sem.on_headers(480, 500)
-        w = sem.window
+        assert sem.window == 32  # Still at max
         sem.on_rate_limit()
-        assert sem.window == max(w // 2, _MIN_CONCURRENCY)
+        assert sem.window == 16
 
-    def test_ema_smoothing(self):
-        """EMA should smooth jumps rather than snapping to target."""
+    def test_recovery_after_backoff(self):
+        """After header-triggered backoff, above-threshold headers should recover fast."""
         sem = _AdaptiveSemaphore(32)
-        # One signal with low ratio should not snap all the way down
-        sem.on_headers(50, 500)  # 10% -> target=4 (MIN), EMA: 0.7*32 + 0.3*4 = 23.6
-        assert sem.window > _MIN_CONCURRENCY  # EMA prevents snap
+        # Drop via low remaining
+        sem.on_headers(5, 500)  # 1% -> target = 4 + 0.1*28 = 6
+        low = sem.window
+        assert low < 10
+        # Recover: 10 above-threshold signals should grow by 10
+        for _ in range(10):
+            sem.on_headers(400, 500)  # 80% remaining
+        assert sem.window == low + 10
 
 
 # --- Rate limit detection ---
