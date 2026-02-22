@@ -5,7 +5,6 @@ Also used by Together and local (OpenAI-compatible API).
 
 import os
 import re
-import time
 
 import httpx
 
@@ -223,35 +222,3 @@ def call_messages_sync(client, model_id: str, messages: list, **kwargs):
         else:
             direct_cache.set(key, texts)
     return texts, usage
-
-
-async def bench_stream(client, model_id: str, messages: list, **kwargs):
-    """Streaming benchmark -> (ttft, total_time, output_tokens)."""
-    kwargs = dict(kwargs)
-
-    t0 = time.monotonic()
-    ttft = None
-    chunks: list[str] = []
-
-    stream = await client.chat.completions.create(
-        model=model_id,
-        messages=messages,
-        stream=True,
-        stream_options={"include_usage": True},
-        **kwargs,
-    )
-    last_chunk = None
-    async for chunk in stream:
-        delta = chunk.choices[0].delta.content if chunk.choices else None
-        if delta:
-            if ttft is None:
-                ttft = time.monotonic() - t0
-            chunks.append(delta)
-        last_chunk = chunk
-
-    total = time.monotonic() - t0
-    output_tokens = len("".join(chunks)) // 4
-    if last_chunk and hasattr(last_chunk, "usage") and last_chunk.usage:
-        output_tokens = last_chunk.usage.completion_tokens or output_tokens
-
-    return ttft or total, total, output_tokens

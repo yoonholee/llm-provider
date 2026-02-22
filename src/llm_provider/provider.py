@@ -674,7 +674,7 @@ class LLM:
 
     def batch_status(self, batch_id: str) -> dict:
         """Check batch job status. Returns {"status": str, "counts": dict}."""
-        provider, n_prompts, raw_id = self._decode_batch_id(batch_id)
+        provider, _, raw_id = self._decode_batch_id(batch_id)
         from llm_provider.providers import _batch
 
         if provider == "openai":
@@ -736,7 +736,6 @@ class LLM:
         from llm_provider.providers import _batch as _batch_mod
 
         batch_id = self.batch_submit(prompts, system_prompt, **kwargs)
-        provider, n_prompts, raw_id = self._decode_batch_id(batch_id)
 
         def _status_fn():
             return self.batch_status(batch_id)
@@ -840,37 +839,3 @@ def multi_chat(
         print(f"  {len(models)} models |{cost_str} {elapsed:.1f}s")
 
     return results
-
-
-# --- Benchmark helpers ---
-
-
-async def _bench_one_stream(model: str, messages: list, *, clients=None, **kwargs):
-    """Single streaming request -> (ttft, total_time, output_tokens)."""
-    clients = clients or {}
-    if _is_gemini(model) and "gemini" in clients:
-        return await gemini.bench_stream(clients["gemini"], model, messages, **kwargs)
-    if _is_openai(model) and "openai" in clients:
-        return await openai_api.bench_stream(
-            clients["openai"], openai_api.model_id(model), messages, **kwargs
-        )
-    if _is_together(model) and "together" in clients:
-        return await openai_api.bench_stream(
-            clients["together"], together.model_id(model), messages, **kwargs
-        )
-    if _is_local(model) and "local" in clients:
-        return await openai_api.bench_stream(
-            clients["local"], local.model_id(model), messages, **kwargs
-        )
-    if _is_sambanova(model) and "sambanova" in clients:
-        return await openai_api.bench_stream(
-            clients["sambanova"], sambanova.model_id(model), messages, **kwargs
-        )
-    if _is_openrouter(model) and "openrouter" in clients:
-        return await openai_api.bench_stream(
-            clients["openrouter"],
-            openrouter.model_id(model),
-            messages,
-            **openrouter.inject_provider_kwargs(kwargs),
-        )
-    return await litellm_api.bench_stream(model, messages, **kwargs)

@@ -162,7 +162,9 @@ def gemini_submit(
     thinking_config = kwargs.pop("thinking_config", None)
     if thinking_config is None:
         thinking_config = types.ThinkingConfig(thinking_budget=0)
-    max_tokens = kwargs.pop("max_tokens", None) or kwargs.pop("max_output_tokens", None)
+    max_tokens = kwargs.pop("max_tokens", None)
+    if max_tokens is None:
+        max_tokens = kwargs.pop("max_output_tokens", None)
     temperature = kwargs.pop("temperature", None)
 
     config = types.GenerateContentConfig(

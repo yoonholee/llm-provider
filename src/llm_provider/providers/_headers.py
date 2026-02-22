@@ -14,9 +14,9 @@ def parse_openai_headers(headers) -> dict | None:
     limit = headers.get("x-ratelimit-limit-requests")
     if remaining is not None and limit is not None:
         try:
-            r, l = int(remaining), int(limit)
-            if l > 0:
-                return {"remaining": r, "limit": l}
+            rem, lim = int(remaining), int(limit)
+            if lim > 0:
+                return {"remaining": rem, "limit": lim}
         except (ValueError, TypeError):
             pass
     return None

@@ -34,4 +34,4 @@ def model_id(model: str) -> str:
     return model.removeprefix("local/")
 
 
-# call() and bench_stream() delegate to openai_api (OpenAI-compatible)
+# call() delegates to openai_api (OpenAI-compatible)

@@ -1,7 +1,6 @@
 """Gemini provider via native google.genai SDK with streaming."""
 
 import os
-import time
 
 from llm_provider._cache import cache_key, cache_key_messages, direct_cache
 from llm_provider.providers._pool import ClientPool
@@ -206,56 +205,3 @@ def call_messages_sync(pool, model: str, messages: list, **kwargs):
     if use_cache and texts[0]:
         direct_cache.set(key, texts[0])
     return texts, usage
-
-
-async def bench_stream(pool, model: str, messages: list, **kwargs):
-    """Streaming benchmark -> (ttft, total_time, output_tokens)."""
-    import google.genai.types as types
-
-    kwargs = dict(kwargs)
-    mid = model_id(model)
-
-    thinking_config = kwargs.pop(
-        "thinking_config", types.ThinkingConfig(thinking_budget=0)
-    )
-    max_tokens = kwargs.pop("max_tokens", None)
-    if max_tokens is None:
-        max_tokens = kwargs.pop("max_output_tokens", None)
-    kwargs.pop("temperature", None)
-
-    system_instruction = None
-    prompt = ""
-    for msg in messages:
-        if msg["role"] == "system":
-            system_instruction = msg["content"]
-        elif msg["role"] == "user":
-            prompt = msg["content"]
-
-    config = types.GenerateContentConfig(
-        thinking_config=thinking_config,
-        system_instruction=system_instruction,
-        **({"max_output_tokens": max_tokens} if max_tokens is not None else {}),
-    )
-
-    t0 = time.monotonic()
-    ttft = None
-    chunks: list[str] = []
-    last_chunk = None
-
-    async for chunk in await pool.current.aio.models.generate_content_stream(
-        model=mid, contents=prompt, config=config
-    ):
-        if chunk.text:
-            if ttft is None:
-                ttft = time.monotonic() - t0
-            chunks.append(chunk.text)
-        last_chunk = chunk
-
-    total = time.monotonic() - t0
-    output_tokens = len("".join(chunks)) // 4
-    if last_chunk and last_chunk.usage_metadata:
-        output_tokens = (
-            last_chunk.usage_metadata.candidates_token_count or output_tokens
-        )
-
-    return ttft or total, total, output_tokens
