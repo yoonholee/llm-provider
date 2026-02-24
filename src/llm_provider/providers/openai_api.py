@@ -111,6 +111,14 @@ async def call(
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": prompt})
 
+    # Newer OpenAI models (gpt-5-*, o1, o3, o4) require max_completion_tokens
+    # instead of max_tokens. Auto-convert. Reasoning models need much higher
+    # limits since reasoning tokens count toward the cap.
+    if "max_tokens" in kwargs and "max_completion_tokens" not in kwargs:
+        if any(model_id.startswith(p) for p in ("gpt-5", "o1", "o3", "o4")):
+            requested = kwargs.pop("max_tokens")
+            kwargs["max_completion_tokens"] = max(requested, 32768)
+
     # Reasoning models reject temperature
     if kwargs.get("max_completion_tokens") and "temperature" in kwargs:
         kwargs.pop("temperature")
@@ -171,6 +179,14 @@ def call_messages_sync(client, model_id: str, messages: list, **kwargs):
     """Sync chat completion with pre-built messages. Returns (texts, usage)."""
     kwargs = dict(kwargs)
     use_cache = kwargs.pop("cache", True)
+
+    # Newer OpenAI models (gpt-5-*, o1, o3, o4) require max_completion_tokens
+    # instead of max_tokens. Auto-convert. Reasoning models need much higher
+    # limits since reasoning tokens count toward the cap.
+    if "max_tokens" in kwargs and "max_completion_tokens" not in kwargs:
+        if any(model_id.startswith(p) for p in ("gpt-5", "o1", "o3", "o4")):
+            requested = kwargs.pop("max_tokens")
+            kwargs["max_completion_tokens"] = max(requested, 32768)
 
     if kwargs.get("max_completion_tokens") and "temperature" in kwargs:
         kwargs.pop("temperature")
