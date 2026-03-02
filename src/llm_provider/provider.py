@@ -11,13 +11,10 @@ from pathlib import Path
 from typing import Any
 
 from llm_provider.providers import (
+    _registry as registry,
     gemini,
     litellm_api,
-    local,
     openai_api,
-    openrouter,
-    sambanova,
-    together,
 )
 
 log = logging.getLogger(__name__)
@@ -195,7 +192,7 @@ def _get_global_semaphore() -> _FileSlotSemaphore | None:
 
 # --- Provider detection ---
 
-_OPENAI_PREFIXES = ("gpt-", "o1", "o3", "o4", "chatgpt-")
+_OPENAI_PREFIXES = registry._OPENAI_PREFIXES
 
 
 def _is_gemini(model: str) -> bool:
@@ -282,22 +279,17 @@ class LLM:
         self.total_cost = 0.0
         self._sync_client = None
         self._sem = _AdaptiveSemaphore(max_concurrent)
+        self._provider = None
 
         if _is_gemini(model):
             self._client = gemini.create_client()
-        elif _is_openai(model):
-            self._client = openai_api.create_client(
-                max_retries=max_retries,
-                on_headers=self._sem.on_headers,
-            )
-        elif _is_together(model):
-            self._client = together.create_client(max_retries=max_retries)
-        elif _is_local(model):
-            self._client = local.create_client(max_retries=max_retries)
-        elif _is_sambanova(model):
-            self._client = sambanova.create_client(max_retries=max_retries)
-        elif _is_openrouter(model):
-            self._client = openrouter.create_client(max_retries=max_retries)
+        else:
+            self._provider = registry.detect(model)
+            if self._provider:
+                self._client = self._provider.create_async_client(
+                    max_retries=max_retries,
+                    on_headers=self._sem.on_headers if self._provider.http2 else None,
+                )
 
     def generate(
         self,
@@ -399,45 +391,13 @@ class LLM:
             texts, usage = await gemini.call(
                 self._client, self.model, prompt, system_prompt, **kwargs
             )
-        elif _is_openai(self.model):
+        elif self._provider:
+            mid = self._provider.model_id(self.model)
+            kw = kwargs
+            if self._provider.inject_kwargs:
+                kw = self._provider.inject_kwargs(kw)
             texts, usage = await openai_api.call(
-                self._client,
-                openai_api.model_id(self.model),
-                prompt,
-                system_prompt,
-                **kwargs,
-            )
-        elif _is_together(self.model):
-            texts, usage = await openai_api.call(
-                self._client,
-                together.model_id(self.model),
-                prompt,
-                system_prompt,
-                **kwargs,
-            )
-        elif _is_local(self.model):
-            texts, usage = await openai_api.call(
-                self._client,
-                local.model_id(self.model),
-                prompt,
-                system_prompt,
-                **kwargs,
-            )
-        elif _is_sambanova(self.model):
-            texts, usage = await openai_api.call(
-                self._client,
-                sambanova.model_id(self.model),
-                prompt,
-                system_prompt,
-                **kwargs,
-            )
-        elif _is_openrouter(self.model):
-            texts, usage = await openai_api.call(
-                self._client,
-                openrouter.model_id(self.model),
-                prompt,
-                system_prompt,
-                **openrouter.inject_provider_kwargs(kwargs),
+                self._client, mid, prompt, system_prompt, **kw
             )
         else:
             texts, usage = await litellm_api.call(
@@ -529,24 +489,10 @@ class LLM:
         """Lazy-create sync client on first chat() call."""
         if self._sync_client is not None:
             return self._sync_client
-        if _is_openai(self.model):
-            self._sync_client = openai_api.create_sync_client(
+        if self._provider:
+            self._sync_client = self._provider.create_sync_client(
                 max_retries=self.max_retries,
-                on_headers=self._sem.on_headers,
-            )
-        elif _is_together(self.model):
-            self._sync_client = together.create_sync_client(
-                max_retries=self.max_retries
-            )
-        elif _is_local(self.model):
-            self._sync_client = local.create_sync_client(max_retries=self.max_retries)
-        elif _is_sambanova(self.model):
-            self._sync_client = sambanova.create_sync_client(
-                max_retries=self.max_retries
-            )
-        elif _is_openrouter(self.model):
-            self._sync_client = openrouter.create_sync_client(
-                max_retries=self.max_retries
+                on_headers=self._sem.on_headers if self._provider.http2 else None,
             )
         # Gemini: reuse self._client (has sync methods via .models)
         # litellm: no client needed (module-level functions)
@@ -560,40 +506,13 @@ class LLM:
             return gemini.call_messages_sync(
                 self._client, self.model, messages, **kwargs
             )
-        elif _is_openai(self.model):
+        elif self._provider:
+            mid = self._provider.model_id(self.model)
+            kw = kwargs
+            if self._provider.inject_kwargs:
+                kw = self._provider.inject_kwargs(kw)
             return openai_api.call_messages_sync(
-                self._get_sync_client(),
-                openai_api.model_id(self.model),
-                messages,
-                **kwargs,
-            )
-        elif _is_together(self.model):
-            return openai_api.call_messages_sync(
-                self._get_sync_client(),
-                together.model_id(self.model),
-                messages,
-                **kwargs,
-            )
-        elif _is_local(self.model):
-            return openai_api.call_messages_sync(
-                self._get_sync_client(),
-                local.model_id(self.model),
-                messages,
-                **kwargs,
-            )
-        elif _is_sambanova(self.model):
-            return openai_api.call_messages_sync(
-                self._get_sync_client(),
-                sambanova.model_id(self.model),
-                messages,
-                **kwargs,
-            )
-        elif _is_openrouter(self.model):
-            return openai_api.call_messages_sync(
-                self._get_sync_client(),
-                openrouter.model_id(self.model),
-                messages,
-                **openrouter.inject_provider_kwargs(kwargs),
+                self._get_sync_client(), mid, messages, **kw
             )
         else:
             return litellm_api.call_messages_sync(

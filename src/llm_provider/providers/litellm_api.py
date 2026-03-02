@@ -22,8 +22,9 @@ async def call(
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": prompt})
 
-    # Reasoning models reject temperature
-    if kwargs.get("max_completion_tokens") and "temperature" in kwargs:
+    # Reasoning models reject temperature (defensive — reasoning models
+    # typically route through direct SDK, not litellm)
+    if any(model.startswith(p) for p in ("o1", "o3", "o4")) and "temperature" in kwargs:
         kwargs.pop("temperature")
 
     response = await _litellm().acompletion(

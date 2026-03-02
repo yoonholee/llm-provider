@@ -21,7 +21,7 @@ from llm_provider.provider import (
     multi_chat,
     multi_generate,
 )
-from llm_provider.providers import gemini, local, openai_api, openrouter, together
+from llm_provider.providers import _registry as registry, gemini, openai_api
 from llm_provider.providers._headers import parse_openai_headers
 
 
@@ -254,21 +254,29 @@ class TestModelId:
 
     def test_together_model_id(self):
         assert (
-            together.model_id("together_ai/meta-llama/Llama-3-8b")
+            registry.PROVIDERS["together"].model_id("together_ai/meta-llama/Llama-3-8b")
             == "meta-llama/Llama-3-8b"
         )
 
     def test_local_model_id(self):
-        assert local.model_id("local/Qwen/Qwen3-4B") == "Qwen/Qwen3-4B"
-        assert local.model_id("local/meta-llama/Llama-3-8b") == "meta-llama/Llama-3-8b"
+        assert (
+            registry.PROVIDERS["local"].model_id("local/Qwen/Qwen3-4B")
+            == "Qwen/Qwen3-4B"
+        )
+        assert (
+            registry.PROVIDERS["local"].model_id("local/meta-llama/Llama-3-8b")
+            == "meta-llama/Llama-3-8b"
+        )
 
     def test_openrouter_model_id(self):
         assert (
-            openrouter.model_id("openrouter/anthropic/claude-sonnet-4")
+            registry.PROVIDERS["openrouter"].model_id(
+                "openrouter/anthropic/claude-sonnet-4"
+            )
             == "anthropic/claude-sonnet-4"
         )
         assert (
-            openrouter.model_id("openrouter/openai/gpt-4.1-nano")
+            registry.PROVIDERS["openrouter"].model_id("openrouter/openai/gpt-4.1-nano")
             == "openai/gpt-4.1-nano"
         )
 
@@ -749,10 +757,10 @@ class TestSambaNovaProvider:
         assert not _is_sambanova("gemini/gemini-3-flash-preview")
 
     def test_model_id(self):
-        from llm_provider.providers import sambanova
-
         assert (
-            sambanova.model_id("sambanova/Meta-Llama-3.3-70B-Instruct")
+            registry.PROVIDERS["sambanova"].model_id(
+                "sambanova/Meta-Llama-3.3-70B-Instruct"
+            )
             == "Meta-Llama-3.3-70B-Instruct"
         )
 
@@ -779,7 +787,9 @@ class TestOpenRouterProvider:
 
     def test_model_id(self):
         assert (
-            openrouter.model_id("openrouter/anthropic/claude-sonnet-4")
+            registry.PROVIDERS["openrouter"].model_id(
+                "openrouter/anthropic/claude-sonnet-4"
+            )
             == "anthropic/claude-sonnet-4"
         )
 
@@ -794,27 +804,31 @@ class TestOpenRouterProvider:
             assert hasattr(llm, "_client")
 
     def test_inject_default_provider(self):
-        """inject_provider_kwargs should add sort=price by default."""
-        result = openrouter.inject_provider_kwargs({})
+        """inject_kwargs should add sort=price by default."""
+        inject = registry.PROVIDERS["openrouter"].inject_kwargs
+        result = inject({})
         assert result["extra_body"]["provider"]["sort"] == "price"
 
     def test_inject_preserves_existing_provider(self):
         """User-supplied provider config should not be overwritten."""
+        inject = registry.PROVIDERS["openrouter"].inject_kwargs
         kwargs = {"extra_body": {"provider": {"sort": "throughput"}}}
-        result = openrouter.inject_provider_kwargs(kwargs)
+        result = inject(kwargs)
         assert result["extra_body"]["provider"]["sort"] == "throughput"
 
     def test_inject_preserves_other_extra_body(self):
         """Other extra_body keys should be preserved."""
+        inject = registry.PROVIDERS["openrouter"].inject_kwargs
         kwargs = {"extra_body": {"transforms": ["middle-out"]}}
-        result = openrouter.inject_provider_kwargs(kwargs)
+        result = inject(kwargs)
         assert result["extra_body"]["transforms"] == ["middle-out"]
         assert result["extra_body"]["provider"]["sort"] == "price"
 
     def test_inject_does_not_mutate_input(self):
-        """inject_provider_kwargs should not mutate the original dict."""
+        """inject_kwargs should not mutate the original dict."""
+        inject = registry.PROVIDERS["openrouter"].inject_kwargs
         original = {"temperature": 0.7}
-        result = openrouter.inject_provider_kwargs(original)
+        result = inject(original)
         assert "extra_body" not in original
         assert "extra_body" in result
 

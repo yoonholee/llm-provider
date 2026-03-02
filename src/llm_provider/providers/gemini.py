@@ -3,6 +3,7 @@
 import os
 
 from llm_provider._cache import cache_key, cache_key_messages, direct_cache
+from llm_provider.pricing import cost as _pricing_cost
 from llm_provider.providers._pool import ClientPool
 
 
@@ -105,6 +106,11 @@ async def call(pool, model: str, prompt: str, system_prompt: str = "", **kwargs)
                 for r in results
                 if r[1] and r[1].usage_metadata
             )
+        c = _pricing_cost(
+            mid, usage.get("input_tokens", 0), usage.get("output_tokens", 0)
+        )
+        if c is not None:
+            usage["cost"] = c
     else:
         text, last_chunk = await _single_call()
         texts = [text]
@@ -113,6 +119,11 @@ async def call(pool, model: str, prompt: str, system_prompt: str = "", **kwargs)
             meta = last_chunk.usage_metadata
             usage["input_tokens"] = meta.prompt_token_count or 0
             usage["output_tokens"] = meta.candidates_token_count or 0
+        c = _pricing_cost(
+            mid, usage.get("input_tokens", 0), usage.get("output_tokens", 0)
+        )
+        if c is not None:
+            usage["cost"] = c
 
     if use_cache and texts[0]:
         if len(texts) == 1:
@@ -201,6 +212,9 @@ def call_messages_sync(pool, model: str, messages: list, **kwargs):
         meta = response.usage_metadata
         usage["input_tokens"] = meta.prompt_token_count or 0
         usage["output_tokens"] = meta.candidates_token_count or 0
+    c = _pricing_cost(mid, usage.get("input_tokens", 0), usage.get("output_tokens", 0))
+    if c is not None:
+        usage["cost"] = c
 
     if use_cache and texts[0]:
         direct_cache.set(key, texts[0])
