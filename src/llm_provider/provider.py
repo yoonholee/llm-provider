@@ -51,6 +51,16 @@ class _AdaptiveSemaphore:
         self._sem = asyncio.Semaphore(initial)
         self._has_header_signal = False
 
+    def rebind(self):
+        """Recreate the inner Semaphore for the current event loop.
+
+        asyncio.Semaphore binds to a loop on first contended acquire().
+        Since generate() uses asyncio.run() (new loop each call), the old
+        semaphore becomes unusable. This preserves adaptive state (window,
+        max, header flag) while creating a fresh semaphore.
+        """
+        self._sem = asyncio.Semaphore(self._window)
+
     async def acquire(self):
         await self._sem.acquire()
 
@@ -337,6 +347,7 @@ class LLM:
     async def _batch(
         self, prompts: list[str], system_prompt: str, **kwargs
     ) -> list[list[str]]:
+        self._sem.rebind()
         sem = self._sem
         global_sem = _get_global_semaphore()
 
