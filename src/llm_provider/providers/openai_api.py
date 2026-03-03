@@ -31,6 +31,29 @@ def model_id(model: str) -> str:
 _REASONING_PREFIXES = ("o1", "o3", "o4")
 _MAX_COMPLETION_PREFIXES = ("gpt-5", "o1", "o3", "o4")
 
+# Qwen3.5 recommended sampling parameters (model thinks by default)
+# Thinking general:           temperature=1.0, top_p=0.95, top_k=20, min_p=0.0, presence_penalty=1.5  [DEFAULT]
+# Thinking coding (WebDev):   temperature=0.6, top_p=0.95, top_k=20, min_p=0.0, presence_penalty=0.0
+# Instruct (non-thinking) general:  temperature=0.7, top_p=0.8,  top_k=20, min_p=0.0, presence_penalty=1.5
+# Instruct (non-thinking) reasoning: temperature=1.0, top_p=0.95, top_k=20, min_p=0.0, presence_penalty=1.5
+# All modes: repetition_penalty=1.0, max_tokens=32768 (81920 for hard math/code)
+# <think>...</think> stripping already handled by strip_thinking()
+_QWEN35_DEFAULTS = {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "presence_penalty": 1.5,
+    "max_tokens": 32768,
+}
+_QWEN35_EXTRA_DEFAULTS = {
+    "top_k": 20,
+    "min_p": 0.0,
+    "repetition_penalty": 1.0,
+}
+
+
+def _is_qwen35(mid: str) -> bool:
+    return "qwen3.5" in mid.lower()
+
 
 def _prepare_kwargs(mid: str, kwargs: dict) -> tuple[dict, bool]:
     """Normalize kwargs for reasoning model compatibility. Returns (kwargs, use_cache)."""
@@ -47,6 +70,17 @@ def _prepare_kwargs(mid: str, kwargs: dict) -> tuple[dict, bool]:
     # Reasoning models reject temperature
     if any(mid.startswith(p) for p in _REASONING_PREFIXES):
         kwargs.pop("temperature", None)
+
+    # Qwen3.5: inject recommended defaults (user-provided values take precedence)
+    if _is_qwen35(mid):
+        for k, v in _QWEN35_DEFAULTS.items():
+            kwargs.setdefault(k, v)
+        extra = kwargs.get("extra_body") or {}
+        for k, v in _QWEN35_EXTRA_DEFAULTS.items():
+            if k not in kwargs and k not in extra:
+                extra[k] = v
+        if extra:
+            kwargs["extra_body"] = extra
 
     return kwargs, use_cache
 

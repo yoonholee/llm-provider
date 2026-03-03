@@ -342,6 +342,48 @@ class TestStripThinking:
         assert openai_api.strip_thinking(raw) == ""
 
 
+class TestPrepareKwargs:
+    """Test _prepare_kwargs handles model-specific defaults."""
+
+    def test_qwen35_injects_defaults(self):
+        """Qwen3.5 models get recommended sampling defaults."""
+        kwargs, _ = openai_api._prepare_kwargs("Qwen/Qwen3.5-27B", {})
+        assert kwargs["temperature"] == 1.0
+        assert kwargs["top_p"] == 0.95
+        assert kwargs["presence_penalty"] == 1.5
+        assert kwargs["max_tokens"] == 32768
+        assert kwargs["extra_body"]["top_k"] == 20
+        assert kwargs["extra_body"]["min_p"] == 0.0
+        assert kwargs["extra_body"]["repetition_penalty"] == 1.0
+
+    def test_qwen35_user_overrides(self):
+        """User-provided values take precedence over Qwen3.5 defaults."""
+        kwargs, _ = openai_api._prepare_kwargs(
+            "Qwen/Qwen3.5-27B", {"temperature": 0.6, "extra_body": {"top_k": 50}}
+        )
+        assert kwargs["temperature"] == 0.6
+        assert kwargs["extra_body"]["top_k"] == 50
+        # Non-overridden defaults still applied
+        assert kwargs["top_p"] == 0.95
+        assert kwargs["extra_body"]["min_p"] == 0.0
+
+    def test_qwen35_case_insensitive(self):
+        """Detection works regardless of casing in model path."""
+        kwargs, _ = openai_api._prepare_kwargs("qwen/qwen3.5-35b-a3b", {})
+        assert kwargs["temperature"] == 1.0
+
+    def test_non_qwen35_untouched(self):
+        """Non-Qwen3.5 models don't get defaults injected."""
+        kwargs, _ = openai_api._prepare_kwargs("Qwen/Qwen3-4B", {})
+        assert "temperature" not in kwargs
+        assert "extra_body" not in kwargs
+
+    def test_reasoning_model_strips_temperature(self):
+        """Reasoning models still strip temperature."""
+        kwargs, _ = openai_api._prepare_kwargs("o3-mini", {"temperature": 0.5})
+        assert "temperature" not in kwargs
+
+
 class TestCallThinkingIntegration:
     """Test that openai_api.call() correctly handles thinking in responses."""
 
