@@ -408,6 +408,12 @@ class LLM:
         self.total_output_tokens += usage.get("output_tokens", 0)
         self.total_cached_tokens += usage.get("cached_tokens", 0)
         self.total_cost += usage.get("cost", 0.0)
+
+        if hasattr(self, "_usage_log") and isinstance(self._usage_log, dict):
+            self._usage_log[prompt] = {
+                k: usage.get(k, 0) for k in ("input_tokens", "output_tokens")
+            }
+
         return texts
 
     # --- chat() — sync, messages-based ---

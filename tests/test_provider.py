@@ -644,6 +644,41 @@ class TestLLMGenerate:
         assert k1 != k2
 
 
+# --- Per-call usage logging ---
+
+
+class TestUsageLog:
+    def test_usage_log_opt_in(self):
+        """When _usage_log is set, per-call usage is recorded keyed by prompt."""
+        llm = LLM("anthropic/claude-sonnet-4-6")
+        llm._usage_log = {}
+
+        mock_choice = MagicMock()
+        mock_choice.message.content = "Hello!"
+        mock_response = MagicMock()
+        mock_response.choices = [mock_choice]
+        mock_response.usage.prompt_tokens = 10
+        mock_response.usage.completion_tokens = 5
+        mock_response.usage.prompt_tokens_details = None
+
+        with patch("llm_provider.providers.litellm_api._litellm") as mock_litellm:
+            mock_litellm.return_value.acompletion = AsyncMock(
+                return_value=mock_response
+            )
+            mock_litellm.return_value.completion_cost.return_value = 0.0
+
+            llm.generate("What is 2+2?", silent=True)
+
+        assert "What is 2+2?" in llm._usage_log
+        assert llm._usage_log["What is 2+2?"]["input_tokens"] == 10
+        assert llm._usage_log["What is 2+2?"]["output_tokens"] == 5
+
+    def test_no_usage_log_by_default(self):
+        """Without _usage_log, no per-call tracking (backwards-compatible)."""
+        llm = LLM("anthropic/claude-sonnet-4-6")
+        assert not hasattr(llm, "_usage_log")
+
+
 # --- Retry on 429 ---
 
 
