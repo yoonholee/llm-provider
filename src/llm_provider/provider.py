@@ -291,6 +291,61 @@ class LLM:
                     on_headers=self._sem.on_headers if self._provider.http2 else None,
                 )
 
+    def close(self):
+        """Close underlying HTTP clients to prevent connection leaks."""
+        from llm_provider.providers._pool import ClientPool
+
+        # Close async client(s)
+        client = getattr(self, "_client", None)
+        if client is not None:
+            if isinstance(client, ClientPool):
+                try:
+                    asyncio.run(client.aclose_all())
+                except RuntimeError:
+                    client.close_all()
+            elif hasattr(client, "close"):
+                try:
+                    result = client.close()
+                    if asyncio.iscoroutine(result):
+                        try:
+                            asyncio.run(result)
+                        except RuntimeError:
+                            pass
+                except Exception:
+                    pass
+
+        # Close sync client(s)
+        if self._sync_client is not None:
+            if isinstance(self._sync_client, ClientPool):
+                self._sync_client.close_all()
+            elif hasattr(self._sync_client, "close"):
+                try:
+                    self._sync_client.close()
+                except Exception:
+                    pass
+            self._sync_client = None
+
+        # Close anthropic client
+        anthropic_client = getattr(self, "_anthropic_client", None)
+        if anthropic_client is not None:
+            try:
+                anthropic_client.close()
+            except Exception:
+                pass
+            self._anthropic_client = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
     def generate(
         self,
         prompts: str | list[str],
@@ -710,11 +765,11 @@ def multi_generate(
     silent = kwargs.pop("silent", False)
 
     def _run(model: str):
-        llm = LLM(model)
-        result = llm.generate(
-            prompts, system_prompt=system_prompt, silent=True, **kwargs
-        )
-        return model, result, llm
+        with LLM(model) as llm:
+            result = llm.generate(
+                prompts, system_prompt=system_prompt, silent=True, **kwargs
+            )
+            return model, result, llm.total_cost
 
     results = {}
     total_cost = 0.0
@@ -723,9 +778,9 @@ def multi_generate(
     with ThreadPoolExecutor(max_workers=len(models)) as pool:
         futures = {pool.submit(_run, m): m for m in models}
         for future in as_completed(futures):
-            model, result, llm = future.result()
+            model, result, cost = future.result()
             results[model] = result
-            total_cost += llm.total_cost
+            total_cost += cost
 
     if not silent:
         elapsed = time.monotonic() - t0
@@ -754,9 +809,9 @@ def multi_chat(
     silent = kwargs.pop("silent", False)
 
     def _run(model: str):
-        llm = LLM(model)
-        result = llm.chat(messages, silent=True, **kwargs)
-        return model, result, llm
+        with LLM(model) as llm:
+            result = llm.chat(messages, silent=True, **kwargs)
+            return model, result, llm.total_cost
 
     results = {}
     total_cost = 0.0
@@ -765,9 +820,9 @@ def multi_chat(
     with ThreadPoolExecutor(max_workers=len(models)) as pool:
         futures = {pool.submit(_run, m): m for m in models}
         for future in as_completed(futures):
-            model, result, llm = future.result()
+            model, result, cost = future.result()
             results[model] = result
-            total_cost += llm.total_cost
+            total_cost += cost
 
     if not silent:
         elapsed = time.monotonic() - t0

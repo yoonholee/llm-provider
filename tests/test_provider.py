@@ -1257,3 +1257,61 @@ class TestMultiChat:
         for v in results.values():
             assert isinstance(v, str)
             assert v == "response"
+
+
+# --- Resource cleanup ---
+
+
+class TestLLMClose:
+    def test_close_litellm_no_client(self):
+        """close() on litellm model (no _client) should not raise."""
+        llm = LLM("anthropic/claude-sonnet-4-6")
+        llm.close()  # should be a no-op
+
+    def test_close_openai_client(self):
+        """close() should close the underlying AsyncOpenAI client."""
+        llm = LLM("gpt-4.1-nano")
+        assert hasattr(llm, "_client")
+        llm.close()
+        # Calling close again should be safe
+        llm.close()
+
+    def test_context_manager(self):
+        """LLM should work as a context manager."""
+        with LLM("anthropic/claude-sonnet-4-6") as llm:
+            assert llm.model == "anthropic/claude-sonnet-4-6"
+
+    def test_context_manager_closes_client(self):
+        """Exiting context manager should close the client."""
+        with LLM("gpt-4.1-nano") as llm:
+            assert hasattr(llm, "_client")
+        # sync_client should be None after close
+        assert llm._sync_client is None
+
+    def test_close_with_sync_client(self):
+        """close() should close lazily-created sync client."""
+        llm = LLM("gpt-4.1-nano")
+        sync = llm._get_sync_client()
+        assert sync is not None
+        llm.close()
+        assert llm._sync_client is None
+
+    def test_close_client_pool(self):
+        """close() should close all clients in a ClientPool."""
+        from llm_provider.providers._pool import ClientPool
+
+        mock_clients = [MagicMock() for _ in range(3)]
+        pool = ClientPool(mock_clients)
+        pool.close_all()
+        for c in mock_clients:
+            c.close.assert_called_once()
+
+    def test_aclose_client_pool(self):
+        """aclose_all() should await async close on all clients."""
+        from llm_provider.providers._pool import ClientPool
+
+        mock_clients = [AsyncMock() for _ in range(2)]
+        pool = ClientPool(mock_clients)
+        asyncio.run(pool.aclose_all())
+        for c in mock_clients:
+            c.close.assert_called_once()
