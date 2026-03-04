@@ -40,6 +40,28 @@ class ClientPool:
     def __len__(self):
         return len(self._clients)
 
+    def close_all(self):
+        """Close all clients in the pool."""
+        for client in self._clients:
+            if hasattr(client, "close"):
+                try:
+                    client.close()
+                except TypeError:
+                    pass  # async close — caller handles via aclose_all()
+                except Exception:
+                    pass
+
+    async def aclose_all(self):
+        """Close all async clients in the pool."""
+        for client in self._clients:
+            if hasattr(client, "close"):
+                try:
+                    result = client.close()
+                    if hasattr(result, "__await__"):
+                        await result
+                except Exception:
+                    pass
+
     # Allow pool to be used directly as the client (single-key case)
     def __getattr__(self, name):
         return getattr(self.current, name)
