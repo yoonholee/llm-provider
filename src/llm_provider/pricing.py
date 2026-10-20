@@ -1,6 +1,6 @@
 """Per-token pricing loaded from prices.csv (USD per 1M tokens).
 
-Last updated: 2026-02-17
+Last updated: 2026-10-20 (OpenAI rows; other providers 2026-02-17)
 
 Pricing sources:
   OpenAI:    https://platform.openai.com/docs/pricing
